@@ -826,6 +826,7 @@ static void print_help(void) {
         "  --model-pool <p>|<m>[|<e>]  pool entry, repeatable; '|' separates fields so model may contain '/'\n"
         "  --reasoning-effort <e> low / off / high / max; empty or default omits it\n"
         "  --patch <file>         extra --patch overlay (repeatable)\n"
+        "  --no-web-profile       do not load providers saved by dsh web\n"
         "  --retries <n>          total attempts on failure (default 1)\n"
         "  --retry-delay <sec>    delay between retries (default 2)\n"
         "  --raw                  print only the final answer\n"
@@ -880,6 +881,182 @@ static wchar_t *make_patch(const wchar_t *provider, const wchar_t *model, const 
     return path;
 }
 
+static wchar_t *env_dup(const wchar_t *name) {
+    DWORD n = GetEnvironmentVariableW(name, NULL, 0);
+    if (n <= 1) return NULL;
+    wchar_t *v = (wchar_t *)xmalloc(n * sizeof(wchar_t));
+    GetEnvironmentVariableW(name, v, n);
+    return v;
+}
+
+/* Same home as dsh: a non-blank DSH_HOME, otherwise %USERPROFILE%\.dsh. */
+static wchar_t *resolve_dsh_home(void) {
+    wchar_t *from_env = env_dup(L"DSH_HOME");
+    wchar_t *chosen = NULL;
+    if (from_env) {
+        wchar_t *trimmed = wtrim_dup(from_env);
+        free(from_env);
+        if (trimmed[0]) chosen = trimmed;
+        else free(trimmed);
+    }
+    if (chosen && chosen[0] == L'~' && (chosen[1] == 0 || chosen[1] == L'/' || chosen[1] == L'\\')) {
+        wchar_t *user = env_dup(L"USERPROFILE");
+        if (!user) { free(chosen); return NULL; }
+        const wchar_t *rest = chosen[1] ? chosen + 2 : L"";
+        wchar_t *joined = rest[0] ? join_path(user, rest) : wtrim_dup(user);
+        free(user);
+        free(chosen);
+        chosen = joined;
+    }
+    if (!chosen) {
+        wchar_t *user = env_dup(L"USERPROFILE");
+        if (!user) return NULL;
+        chosen = join_path(user, L".dsh");
+        free(user);
+    }
+    DWORD full_n = GetFullPathNameW(chosen, 0, NULL, NULL);
+    if (full_n == 0) return chosen;
+    wchar_t *full = (wchar_t *)xmalloc(full_n * sizeof(wchar_t));
+    GetFullPathNameW(chosen, full_n, full, NULL);
+    free(chosen);
+    return full;
+}
+
+static wchar_t *web_profile_patch_path(void) {
+    wchar_t *home = resolve_dsh_home();
+    if (!home) return NULL;
+    wchar_t *profiles = join_path(home, L"profiles");
+    wchar_t *web = join_path(profiles, L"web");
+    wchar_t *patch = join_path(web, L"cordis.patch.yml");
+    free(home);
+    free(profiles);
+    free(web);
+    if (!file_exists(patch)) { free(patch); return NULL; }
+    return patch;
+}
+
+static char *read_file_utf8(const wchar_t *path) {
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    Buf b;
+    memset(&b, 0, sizeof b);
+    for (;;) {
+        char tmp[4096];
+        DWORD n = 0;
+        if (!ReadFile(h, tmp, sizeof tmp, &n, NULL) || n == 0) break;
+        buf_add(&b, tmp, (int)n);
+    }
+    CloseHandle(h);
+    buf_add(&b, "", 1);
+    b.n--;
+    return b.p;
+}
+
+static int write_utf8_file(const wchar_t *path, const char *text) {
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    DWORD wr = 0;
+    DWORD n = (DWORD)strlen(text);
+    int ok = WriteFile(h, text, n, &wr, NULL) && wr == n;
+    CloseHandle(h);
+    return ok;
+}
+
+static wchar_t *temp_yml(const wchar_t *tag) {
+    wchar_t temp[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, temp);
+    if (n == 0 || n >= MAX_PATH) return NULL;
+    static int seq;
+    wchar_t name[160];
+    swprintf(name, 160, L"dsh-subagent-%s-%08lx-%d.yml",
+             tag, (unsigned long)GetCurrentProcessId(), ++seq);
+    return join_path(temp, name);
+}
+
+/* Model rows the web Models page writes. Other rows, including UI settings,
+ * belong to the web composition and only warn under headless. */
+static int model_entry_id(const char *id) {
+    return strcmp(id, "agent-default-model") == 0
+        || strncmp(id, "llm-", 4) == 0
+        || strncmp(id, "deepseek-llm", 12) == 0;
+}
+
+static char *entry_id(const char *entry, int elen) {
+    const char *p = entry;
+    const char *end = entry + elen;
+    while (p < end) {
+        const char *nl = (const char *)memchr(p, '\n', (size_t)(end - p));
+        int n = nl ? (int)(nl - p) : (int)(end - p);
+        if (n && p[n - 1] == '\r') n--;
+        int i = 0;
+        if (n >= 2 && p[0] == '-' && p[1] == ' ') i = 2;
+        else {
+            while (i < n && p[i] == ' ') i++;
+            if (i != 2) { if (!nl) break; p = nl + 1; continue; }
+        }
+        while (i < n && (p[i] == ' ' || p[i] == '\t')) i++;
+        if (n - i >= 3 && memcmp(p + i, "id:", 3) == 0) {
+            i += 3;
+            while (i < n && (p[i] == ' ' || p[i] == '\t')) i++;
+            char quote = 0;
+            if (i < n && (p[i] == '"' || p[i] == '\'')) quote = p[i++];
+            int j = i;
+            while (j < n && p[j] != (quote ? quote : ' ') && p[j] != '\t' && p[j] != '#' && p[j] != '\r') j++;
+            if (j == i) return NULL;
+            char *s = (char *)xmalloc((size_t)(j - i) + 1);
+            memcpy(s, p + i, (size_t)(j - i));
+            s[j - i] = 0;
+            return s;
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return NULL;
+}
+
+static char *filter_model_entries(const char *text) {
+    const char *p = text ? text : "";
+    if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) p += 3;
+    Buf out;
+    memset(&out, 0, sizeof out);
+    int kept = 0;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        int len = nl ? (int)(nl - p) : (int)strlen(p);
+        int item = len >= 2 && p[0] == '-' && p[1] == ' ';
+        if (!item) { p = nl ? nl + 1 : p + len; continue; }
+        const char *next = nl ? nl + 1 : p + len;
+        while (*next) {
+            const char *n2 = strchr(next, '\n');
+            int nlen = n2 ? (int)(n2 - next) : (int)strlen(next);
+            if (nlen >= 2 && next[0] == '-' && next[1] == ' ') break;
+            if (!n2) { next += nlen; break; }
+            next = n2 + 1;
+        }
+        int elen = (int)(next - p);
+        char *id = entry_id(p, elen);
+        if (id && model_entry_id(id)) {
+            buf_add(&out, p, elen);
+            if (elen == 0 || p[elen - 1] != '\n') buf_str(&out, "\n");
+            kept++;
+        }
+        free(id);
+        p = next;
+    }
+    if (!kept) { buf_free(&out); return NULL; }
+    buf_add(&out, "", 1);
+    out.n--;
+    return out.p;
+}
+
+static const char CREDENTIAL_PATCH[] =
+    "- id: credentials\n"
+    "  disabled: false\n"
+    "- id: authorization\n"
+    "  disabled: false\n"
+    "- id: deepseek-account\n"
+    "  disabled: false\n";
+
 static void buf_model_ref(Buf *b, const ModelRef *model) {
     char *p = wide_to_utf8(model->provider);
     char *m = wide_to_utf8(model->model);
@@ -931,6 +1108,7 @@ int wmain(int argc, wchar_t **argv) {
     int retries = 1;
     double retry_delay = 2;
     int raw = 0;
+    int skip_web = 0;
 
     int i;
     for (i = 1; i < argc; i++) {
@@ -981,6 +1159,8 @@ int wmain(int argc, wchar_t **argv) {
             if (take_value(argc, argv, &i, &v)) parse_f64(v, &retry_delay);
         } else if (streq(a, L"--raw")) {
             raw = 1;
+        } else if (streq(a, L"--no-web-profile")) {
+            skip_web = 1;
         } else if (streq(a, L"--version")) {
             write_out("dsh-subagent " DSH_SUBAGENT_VERSION "\n");
             free(task);
@@ -1095,11 +1275,76 @@ int wmain(int argc, wchar_t **argv) {
         }
     }
 
+    wchar_t *web_patch = NULL;
+    wchar_t *cred_patch = NULL;
+    if (!skip_web) {
+        wchar_t *src = web_profile_patch_path();
+        if (src) {
+            char *text = read_file_utf8(src);
+            if (!text) {
+                write_err("dsh-subagent: cannot read web profile ");
+                char *shown = wide_to_utf8(src);
+                write_err(shown);
+                write_err("\n");
+                free(shown);
+                free(src);
+                if (tmp_patch) { DeleteFileW(tmp_patch); free(tmp_patch); }
+                free(task); free(node); free(bin);
+                if (old_cwd) { SetCurrentDirectoryW(old_cwd); free(old_cwd); }
+                model_list_free(&models);
+                return 2;
+            }
+            char *filtered = filter_model_entries(text);
+            free(text);
+            if (filtered) {
+                web_patch = temp_yml(L"web");
+                if (!web_patch || !write_utf8_file(web_patch, filtered)) {
+                    write_err("dsh-subagent: cannot write web profile patch.\n");
+                    free(filtered);
+                    free(src);
+                    if (web_patch) { DeleteFileW(web_patch); free(web_patch); }
+                    if (tmp_patch) { DeleteFileW(tmp_patch); free(tmp_patch); }
+                    free(task); free(node); free(bin);
+                    if (old_cwd) { SetCurrentDirectoryW(old_cwd); free(old_cwd); }
+                    model_list_free(&models);
+                    return 2;
+                }
+                free(filtered);
+            }
+            cred_patch = temp_yml(L"credentials");
+            if (!cred_patch || !write_utf8_file(cred_patch, CREDENTIAL_PATCH)) {
+                write_err("dsh-subagent: cannot write credential patch.\n");
+                free(src);
+                if (cred_patch) { DeleteFileW(cred_patch); free(cred_patch); }
+                if (web_patch) { DeleteFileW(web_patch); free(web_patch); }
+                if (tmp_patch) { DeleteFileW(tmp_patch); free(tmp_patch); }
+                free(task); free(node); free(bin);
+                if (old_cwd) { SetCurrentDirectoryW(old_cwd); free(old_cwd); }
+                model_list_free(&models);
+                return 2;
+            }
+            write_err("dsh-subagent: using web profile ");
+            char *shown = wide_to_utf8(src);
+            write_err(shown);
+            write_err("\n");
+            free(shown);
+            free(src);
+        }
+    }
+
     WBuf cmd;
     memset(&cmd, 0, sizeof cmd);
     wbuf_arg(&cmd, node);
     wbuf_arg(&cmd, bin);
     wbuf_s(&cmd, L" --profile headless");
+    if (web_patch) {
+        wbuf_s(&cmd, L" --patch");
+        wbuf_arg(&cmd, web_patch);
+    }
+    if (cred_patch) {
+        wbuf_s(&cmd, L" --patch");
+        wbuf_arg(&cmd, cred_patch);
+    }
     for (i = 0; i < patches.n; i++) {
         wbuf_s(&cmd, L" --patch");
         wbuf_arg(&cmd, patches.items[i]);
@@ -1181,6 +1426,14 @@ int wmain(int argc, wchar_t **argv) {
     if (tmp_patch) {
         DeleteFileW(tmp_patch);
         free(tmp_patch);
+    }
+    if (web_patch) {
+        DeleteFileW(web_patch);
+        free(web_patch);
+    }
+    if (cred_patch) {
+        DeleteFileW(cred_patch);
+        free(cred_patch);
     }
     if (old_cwd) {
         SetCurrentDirectoryW(old_cwd);

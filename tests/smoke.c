@@ -23,6 +23,8 @@ static char g_user_patch_utf8[MAX_PATH * 3];
 static char g_missing_patch_utf8[MAX_PATH * 3];
 static char g_child_cwd_utf8[MAX_PATH * 3];
 static char g_version_out[160];
+static wchar_t g_empty_dsh[MAX_PATH];
+static wchar_t g_web_dsh[MAX_PATH];
 
 static void *xmalloc(size_t n) {
     void *p = malloc(n ? n : 1);
@@ -105,7 +107,7 @@ typedef struct {
     DWORD ms;
 } Result;
 
-static Result run_exe(const wchar_t *arg_cmd, const char *stdin_utf8, const char *scenario, int fails, int no_dsh) {
+static Result run_exe(const wchar_t *arg_cmd, const char *stdin_utf8, const char *scenario, int fails, int no_dsh, int web_home) {
     Result r;
     memset(&r, 0, sizeof r);
     wchar_t case_dir[MAX_PATH];
@@ -133,6 +135,7 @@ static Result run_exe(const wchar_t *arg_cmd, const char *stdin_utf8, const char
     wchar_t fails_w[16];
     swprintf(fails_w, 16, L"%d", fails);
     SetEnvironmentVariableW(L"DSH_FAKE_FAILS", fails_w);
+    SetEnvironmentVariableW(L"DSH_HOME", web_home ? g_web_dsh : g_empty_dsh);
 
     SECURITY_ATTRIBUTES sa;
     memset(&sa, 0, sizeof sa);
@@ -362,6 +365,7 @@ typedef struct {
     const char *scenario;
     int fails;
     int no_dsh;
+    int web_home;
     void (*check)(const Result *);
 } Case;
 
@@ -380,6 +384,7 @@ static void add(const char *name, const char *cmd_utf8, const char *in, const ch
     c->scenario = scenario ? scenario : "ok";
     c->fails = fails;
     c->no_dsh = no_dsh;
+    c->web_home = 0;
     c->check = check;
 }
 
@@ -478,6 +483,32 @@ static void check_no_patch(const Result *r) {
     require(calls(r) == 1, "calls");
     require(!contains(r->log, "agent-default-model"), "unexpected patch");
     require(contains(r->log, "\"patches\":[]"), "empty patches");
+    require(!contains(r->err, "using web profile"), "no web profile");
+}
+static void check_web_profile(const Result *r) {
+    require(r->code == 0, "exit");
+    require(calls(r) == 1, "calls");
+    const char *providers = strstr(r->log, "id: llm-pi-ai");
+    const char *creds = strstr(r->log, "disabled: false");
+    const char *hello = strstr(r->log, "hello: true");
+    const char *web_default = strstr(r->log, "provider: blue-vocalno");
+    const char *selected = strstr(r->log, "provider: ark");
+    require(providers && creds && hello && web_default && selected, "pieces");
+    require(providers < creds && creds < hello && hello < selected, "order");
+    require(web_default < selected, "selection overrides web default");
+    require(contains(r->log, "id: volcengine/deepseek-v4.1-flash"), "slash model");
+    require(!contains(r->log, "ui-settings-general"), "ui dropped");
+    require(contains(r->err, "using web profile"), "notice");
+}
+static void check_web_default(const Result *r) {
+    require(r->code == 0, "exit");
+    require(calls(r) == 1, "calls");
+    require(contains(r->log, "provider: blue-vocalno"), "web default provider");
+    require(contains(r->log, "model: volcengine/deepseek-v4.1-flash"), "web default model");
+    require(!contains(r->log, "deepseek-flash"), "no headless default");
+    require(contains(r->log, "disabled: false"), "credentials");
+    require(!contains(r->log, "ui-settings-general"), "ui dropped");
+    require(contains(r->err, "using web profile"), "notice");
 }
 static void check_pool_bad(const Result *r) {
     require(r->code == 2, "exit");
@@ -841,6 +872,42 @@ int wmain(int argc, wchar_t **argv) {
 
     wchar_t temp[MAX_PATH];
     GetTempPathW(MAX_PATH, temp);
+    wcscpy(g_empty_dsh, temp);
+    if (g_empty_dsh[wcslen(g_empty_dsh) - 1] != L'\\') wcscat(g_empty_dsh, L"\\");
+    wcscat(g_empty_dsh, L"dsh-subagent-empty-home");
+    CreateDirectoryW(g_empty_dsh, NULL);
+    wcscpy(g_web_dsh, temp);
+    if (g_web_dsh[wcslen(g_web_dsh) - 1] != L'\\') wcscat(g_web_dsh, L"\\");
+    wcscat(g_web_dsh, L"dsh-subagent-web-home");
+    CreateDirectoryW(g_web_dsh, NULL);
+    {
+        wchar_t profiles[MAX_PATH], web[MAX_PATH], patch[MAX_PATH];
+        wcscpy(profiles, g_web_dsh); wcscat(profiles, L"\\profiles");
+        wcscpy(web, profiles); wcscat(web, L"\\web");
+        wcscpy(patch, web); wcscat(patch, L"\\cordis.patch.yml");
+        CreateDirectoryW(profiles, NULL);
+        CreateDirectoryW(web, NULL);
+        const char *fixture =
+            "- id: ui-settings-general\n"
+            "  config:\n"
+            "    welcomeNoticeVersion: 1\n"
+            "- id: llm-pi-ai\n"
+            "  config:\n"
+            "    providers:\n"
+            "      blue-vocalno:\n"
+            "        models:\n"
+            "          - id: volcengine/deepseek-v4.1-flash\n"
+            "- id: agent-default-model\n"
+            "  config:\n"
+            "    provider: blue-vocalno\n"
+            "    model: volcengine/deepseek-v4.1-flash\n";
+        HANDLE ph = CreateFileW(patch, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (ph != INVALID_HANDLE_VALUE) {
+            DWORD wr = 0;
+            WriteFile(ph, fixture, (DWORD)strlen(fixture), &wr, NULL);
+            CloseHandle(ph);
+        }
+    }
     wcscpy(g_install, temp);
     if (g_install[wcslen(g_install) - 1] != L'\\') wcscat(g_install, L"\\");
     wcscat(g_install, L"dsh-as-subagent-install");
@@ -1011,13 +1078,23 @@ int wmain(int argc, wchar_t **argv) {
     add("exe model-pool exhaustion does not invent deepseek-official", "--task t --retries 1 --retry-delay 0 --model-pool providerA|model1|high --model-pool providerA|model2 --model-pool providerB|model3 --model-pool route|model666|low", "", "fail-then-ok", 9, 0, check_pool_exhausted);
     add("exe --model is the first pool entry", "--task t --retries 1 --retry-delay 0 --provider providerA --model model1 --reasoning-effort low --model-pool providerB|model3", "", "fail-then-ok", 1, 0, check_pool_primary_first);
     add("exe global reasoning-effort does not cover a pool entry", "--task t --reasoning-effort high --model-pool providerA|model2", "", "ok", 0, 1, check_pool_effort_flag);
+    {
+        char cmd_web[MAX_PATH * 4];
+        sprintf(cmd_web, "--task t --patch \"%s\" --provider ark --model volcengine/deepseek-v4.1-flash", g_user_patch_utf8);
+        add("exe web profile supplies providers and saved credentials", cmd_web, "", "ok", 0, 0, check_web_profile);
+        g_cases[g_case_n - 1].web_home = 1;
+    }
+    add("exe web profile default model is kept when none is requested", "--task t", "", "ok", 0, 0, check_web_default);
+    g_cases[g_case_n - 1].web_home = 1;
+    add("exe --no-web-profile ignores a present web profile", "--task t --no-web-profile", "", "ok", 0, 0, check_no_patch);
+    g_cases[g_case_n - 1].web_home = 1;
 
     check_imports();
     int i;
     for (i = 0; i < g_case_n; i++) {
         Case *c = &g_cases[i];
         g_why = NULL;
-        Result r = run_exe(c->cmd, c->stdin_utf8, c->scenario, c->fails, c->no_dsh);
+        Result r = run_exe(c->cmd, c->stdin_utf8, c->scenario, c->fails, c->no_dsh, c->web_home);
         c->check(&r);
         if (g_why) {
             g_failed++;

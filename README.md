@@ -22,7 +22,7 @@
 ## 前置条件
 
 - 本机 `PATH` 上能找到 `dsh`。`dsh-subagent.exe` 会在同一目录里找 `node.exe` 和 `node_modules/@deepseek-ai/dsh/lib/bin.js`。
-- headless **不使用** GUI 里保存的凭据。API key 按「启动环境变量 → 运行目录 `.env` → `$DSH_HOME/.env`」回退。已经导出为空字符串的环境变量会挡住 `.env`。
+- 找到 `dsh web` 的 profile 时，调用器会带上其中的模型配置，并重新打开 headless 默认关掉的凭据存储，因此 Web 里保存的提供方和密钥可以直接用。没找到时，API key 仍按「启动环境变量 → 运行目录 `.env` → `$DSH_HOME/.env`」回退。已经导出为空字符串的环境变量会挡住 `.env`。
 - `dsh-subagent.exe` 是 Windows x64 程序，面向 Windows 10 及更新版本。它只动态链接系统自带的 `KERNEL32.dll` 和 Universal CRT，不依赖 .NET，也不依赖 VC++ 运行库。
 
 ## 安装
@@ -61,7 +61,8 @@
 | `--model <id>` | `deepseek-flash` | 模型 id。和 `--provider` 一起才能确定一个模型 |
 | `--model-pool <项>` | — | 模型池的一项，可重复。字段用竖线分开，模型 id 可以含 `/` |
 | `--reasoning-effort <e>` | 不填 | 只作用于 `--provider`/`--model`。空或 `default` 表示不写该字段，沿用模型默认等级 |
-| `--patch <file>` | — | 额外的 `--patch` 文件，可重复 |
+| `--patch <file>` | — | 额外的 `--patch` 文件，可重复。写在 web profile 之后，可以覆盖它 |
+| `--no-web-profile` | — | 不读取 `dsh web` 的 profile |
 | `--retries <n>` | 1 | 失败后的总尝试次数。网络抖动建议 5 |
 | `--retry-delay <sec>` | 2 | 重试间隔 |
 | `--raw` | — | 只打印最终答案，不打印 JSON 摘要 |
@@ -69,6 +70,8 @@
 覆盖模型时，调用器会写一份临时 patch。`agent-default-model` 的 `config` 是整体替换，所以 `provider` 和 `model` 会一起写上。思考等级留空时不写 `reasoningEffort`：dsh 只在这个字段缺失时使用该模型的 adapter 默认等级。字面量 `default` 同样按不填处理，不会写成 `reasoningEffort: default`。
 
 一个模型是 `provider` + `model`。模型池的一项写成 `provider|model` 或 `provider|model|effort`，例如 `providerA|model1|high` 和 `ark|volcengine/deepseek-v4.1-flash`。竖线只分隔字段，模型 id 里的 `/` 会原样保留。在 cmd 和 PowerShell 里整项要加引号，因为 `|` 是管道符。调用器从第一项开始；某一项在 `--retries` 全部失败后才换下一项，并在 stderr 打印 `model pool switch`。池内换项要告诉用户，但这不是失败回退。整个池都失败后，才回退到 `deepseek-official`（先 `deepseek-flash`，已经试过则 `deepseek-chat`），再失败才改用外部 Agent 自己的 subagent。
+
+`dsh web` 把提供方写在 `$DSH_HOME/profiles/web/cordis.patch.yml`（`DSH_HOME` 为空时是 `%USERPROFILE%\.dsh`）。headless 自己的 profile 没有这份配置，而且默认关掉凭据存储，所以只指定模型名不够。调用器会自己找到这份文件，留下 `llm-*`、`deepseek-llm*` 和 `agent-default-model`，丢掉界面设置，并补上打开凭据存储的 patch。密钥仍在 `$DSH_HOME/.credentials.yaml`，不会被复制。没有指定模型时，沿用 Web 里保存的默认模型。显式的 `--patch`、`--provider`、`--model` 和 `--model-pool` 写在后面，覆盖这个默认值。`--no-web-profile` 跳过这一步。用上 web profile 时，stderr 有一行 `dsh-subagent: using web profile ...`。
 
 ## 返回
 
@@ -87,13 +90,13 @@ dsh 自己的 stdout 是 NDJSON 事件流（`session`、`status`、`text`、`thi
 
 ## 版本
 
-当前版本是 **v1.0.1**。版本号只写在仓库根目录的 `VERSION` 里。`scripts\build.cmd` 读取它，生成 `scripts\version.h`，再编进 `dsh-subagent.exe`。
+当前版本是 **v1.1.0**。版本号只写在仓库根目录的 `VERSION` 里。`scripts\build.cmd` 读取它，生成 `scripts\version.h`，再编进 `dsh-subagent.exe`。
 
 ```bat
 scripts\dsh-subagent.exe --version
 ```
 
-输出 `dsh-subagent v1.0.1`。改版本时只改 `VERSION`，然后重新编译。
+输出 `dsh-subagent v1.1.0`。改版本时只改 `VERSION`，然后重新编译。
 
 ## 重新编译与测试
 

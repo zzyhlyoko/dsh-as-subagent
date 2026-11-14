@@ -64,7 +64,7 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 ```
 
 - `--provider`：路由名，默认 `deepseek-official`（DeepSeek API-key 路由）。
-- `--model`：该 provider 下的模型 id。一个模型必须由 `provider` + `model` 一起确定。已知内置：`deepseek-flash`（默认，省额度首选）、`deepseek-chat`、`deepseek-v4-pro`；完整列表以 Web 模型页 / 官方 `/models` 列表为准。要按顺序尝试多个模型，用第 4 节的模型池，不要只重复写 `--model`。
+- `--model`：该 provider 下的模型 id。一个模型必须由 `provider` + `model` 一起确定。已知内置：`deepseek-flash`（默认，省额度首选）、`deepseek-chat`、`deepseek-v4-pro`；完整列表以 Web 模型页 / 官方 `/models` 列表为准。Web 里添加的提供方（包括模型 id 中带 `/` 的）也可以直接写在这里：调用器会读取 `dsh web` 的 profile。要按顺序尝试多个模型，用第 4 节的模型池，不要只重复写 `--model`。
 - `--reasoning-effort`：`low` / `off` / `high` / `max`。它只作用于 `--provider`/`--model` 这一项。留空、纯空白，或字面量 `default`，都表示不填：patch 里不写 `reasoningEffort`。dsh 见到字段缺失时用该模型的 adapter 默认等级（`requested ?? defaultEffort`），不会把字符串 `default` 当成等级 id。模型池里每一项的思考等级写在该项自己的第三段，不继承这个参数。`--model` 的值可以包含 `/`，例如 `volcengine/deepseek-v4.1-flash`；那是模型 id 的一部分，不是 provider。
 
 等价的底层 `--patch` 文件（**provider 与 model 都必填**，缺一启动即失败）：
@@ -92,6 +92,8 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 ```
 
 也可以先用 `--provider` 和 `--model`（以及可选的 `--reasoning-effort`）写第一项，再用重复的 `--model-pool` 追加后面的项。`--reasoning-effort` 不会套到没写第三段的池项上。
+
+`dsh web` 的提供方在 `$DSH_HOME/profiles/web/cordis.patch.yml`，`DSH_HOME` 为空时用 `%USERPROFILE%\.dsh`。headless 不带这份文件，并且默认关闭凭据存储，所以只写模型名时提供方和已保存密钥都不存在。调用器每次启动都会找这个文件：留下 `llm-*`、`deepseek-llm*` 和 `agent-default-model`，丢掉界面设置，再打开凭据存储，让 `$DSH_HOME/.credentials.yaml` 里的密钥生效。没有指定模型时沿用 Web 保存的默认模型。你额外写的 `--patch` 和模型参数在这之后，覆盖该默认值。不要自己再拼 web profile 的路径。`--no-web-profile` 才跳过。stderr 出现 `dsh-subagent: using web profile` 表示这次用上了。
 
 1. 从第一项开始。失败后只重试**当前项**，次数是 `--retries`（网络波动建议 5）。重试还没耗尽时不换模型。
 2. 当前项的重试全部失败后，才换池中的下一项。这是池内切换，**不是失败回退**。stderr 有一行 `dsh-subagent: model pool switch ...`。告诉用户上一项在重试后失败、现在改用池里的下一项，但警告等级要低于回退：不要把它叫作 fallback，也不要建议放弃 dsh。
@@ -137,7 +139,8 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 | `--model <id>` | `deepseek-flash` | 模型 id。和 `--provider` 一起才能确定一个模型 |
 | `--model-pool <项>` | — | 模型池的一项，可重复。顺序即尝试顺序。字段用竖线分开，模型 id 可以含 `/`；第三段只作用于该项 |
 | `--reasoning-effort <e>` | 不填 | 只作用于 `--provider`/`--model`。`low`/`off`/`high`/`max`；空或 `default` 表示沿用模型默认等级 |
-| `--patch <file>` | — | 额外 `--patch` 文件（可重复） |
+| `--patch <file>` | — | 额外 `--patch` 文件（可重复）。位于 web profile 之后，可覆盖它 |
+| `--no-web-profile` | — | 不读取 `dsh web` 的 profile |
 | `--retries <n>` | 1 | 失败重试总次数（网络波动建议 5） |
 | `--retry-delay <sec>` | 2 | 重试间隔秒数 |
 | `--raw` | — | 只输出最终答案，不输出 JSON |
@@ -147,7 +150,7 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 
 - 默认 stdout 是一行 JSON 摘要 `{"exitCode","sessionId","answer","reason","error"}`。`--raw` 只打印最终答案再加一个换行；没有答案时什么都不打印。stderr 仍是 dsh 的流式推理（`dsh: reasoning:`）和诊断（`dsh: <code>: <message>`）。
 - 退出码：0 = 完成；1 = 中止/出错/无轮次；参数或环境不合法时调用器自己返回 2。`answer` 来自最后一条 `final.text`，无损。dsh 的 `--json` 里其余字符串/键上限 8 KiB。
-- 凭据：headless **不用 GUI 保存的凭据**，API key 按「启动环境变量 → 运行目录 `.env` → `$DSH_HOME/.env`」回退；已导出为空的环境变量会遮蔽 `.env` 回退。
+- 凭据：找到 web profile 时使用 `$DSH_HOME/.credentials.yaml` 里已保存的密钥，优先于环境变量。没找到，或加了 `--no-web-profile` 时，API key 按「启动环境变量 → 运行目录 `.env` → `$DSH_HOME/.env`」回退；已导出为空的环境变量会遮蔽 `.env` 回退。
 
 ## 10. 已知限制与坑
 
