@@ -438,6 +438,7 @@ static void check_model_chat(const Result *r) {
 static void check_provider_only(const Result *r) {
     require(contains(r->log, "provider: other-route"), "provider");
     require(contains(r->log, "model: deepseek-flash"), "model");
+    require(!contains(r->log, "reasoningEffort"), "no effort");
 }
 static void check_effort(const Result *r, const char *effort) {
     require(contains(r->log, "provider: deepseek-official"), "provider");
@@ -777,7 +778,14 @@ int wmain(int argc, wchar_t **argv) {
     add("exe unknown short option", "-x", "", "ok", 0, 1, check_unknown);
     add("exe reasoning-effort case", "--task t --reasoning-effort HIGH", "", "ok", 0, 1, check_effort_bad);
     add("exe reasoning-effort medium", "--task t --reasoning-effort medium", "", "ok", 0, 1, check_effort_bad);
-    add("exe reasoning-effort empty", "--task t --reasoning-effort \"\"", "", "ok", 0, 1, check_effort_bad);
+    add("exe reasoning-effort Default is rejected", "--task t --reasoning-effort Default", "", "ok", 0, 1, check_effort_bad);
+    add("exe empty reasoning-effort omits the field", "--task t --model deepseek-chat --reasoning-effort \"\"", "", "ok", 0, 0, check_model_chat);
+    add("exe blank reasoning-effort omits the field", "--task t --model deepseek-chat --reasoning-effort \"   \"", "", "ok", 0, 0, check_model_chat);
+    add("exe reasoning-effort default omits the field", "--task t --model deepseek-chat --reasoning-effort default", "", "ok", 0, 0, check_model_chat);
+    add("exe reasoning-effort default with spaces omits the field", "--task t --model deepseek-chat --reasoning-effort \"  default  \"", "", "ok", 0, 0, check_model_chat);
+    add("exe empty reasoning-effort alone writes no patch", "--task t --reasoning-effort \"\"", "", "ok", 0, 0, check_no_patch);
+    add("exe reasoning-effort default alone writes no patch", "--task t --reasoning-effort default", "", "ok", 0, 0, check_no_patch);
+    add("exe missing reasoning-effort value omits the field", "--task t --model deepseek-chat --reasoning-effort", "", "ok", 0, 0, check_model_chat);
     add("exe --help", "--help", "", "ok", 0, 1, check_help);
     add("exe -h", "-h", "", "ok", 0, 1, check_help);
     add("exe PATH has no dsh install", "--task t", "", "ok", 0, 1, check_no_install);

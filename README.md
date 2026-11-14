@@ -58,13 +58,13 @@
 | `--cwd <dir>` | 当前目录 | 子会话的工作区根 |
 | `--provider <name>` | `deepseek-official` | provider 路由 |
 | `--model <id>` | `deepseek-flash` | 模型 id。只有给出模型相关参数时才覆盖 |
-| `--reasoning-effort <e>` | — | `low` / `off` / `high` / `max` |
+| `--reasoning-effort <e>` | 不填 | `low` / `off` / `high` / `max`。空或 `default` 表示不写该字段，沿用模型默认等级 |
 | `--patch <file>` | — | 额外的 `--patch` 文件，可重复 |
 | `--retries <n>` | 1 | 失败后的总尝试次数。网络抖动建议 5 |
 | `--retry-delay <sec>` | 2 | 重试间隔 |
 | `--raw` | — | 只打印最终答案，不打印 JSON 摘要 |
 
-覆盖模型时，调用器会写一份临时 patch。`agent-default-model` 的 `config` 是整体替换，所以 `provider` 和 `model` 会一起写上。
+覆盖模型时，调用器会写一份临时 patch。`agent-default-model` 的 `config` 是整体替换，所以 `provider` 和 `model` 会一起写上。思考等级留空时不写 `reasoningEffort`：dsh 只在这个字段缺失时使用该模型的 adapter 默认等级。字面量 `default` 同样按不填处理，不会写成 `reasoningEffort: default`。
 
 ## 返回
 

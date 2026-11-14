@@ -196,6 +196,16 @@ static int effort_ok(const wchar_t *s) {
     return streq(s, L"low") || streq(s, L"off") || streq(s, L"high") || streq(s, L"max");
 }
 
+/* Blank, whitespace, or the literal "default" means omit the field. dsh treats
+ * a missing reasoningEffort as the adapter default (requested ?? defaultEffort).
+ * The string "default" is not itself an effort id. */
+static int effort_blank(const wchar_t *s) {
+    wchar_t *t = wtrim_dup(s);
+    int blank = t[0] == 0 || streq(t, L"default");
+    free(t);
+    return blank;
+}
+
 static int file_exists(const wchar_t *path) {
     DWORD a = GetFileAttributesW(path);
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
@@ -725,7 +735,7 @@ static void print_help(void) {
         "  --cwd <dir>            working directory for the child session\n"
         "  --provider <name>      provider route (default deepseek-official)\n"
         "  --model <id>           model id (default deepseek-flash when overriding)\n"
-        "  --reasoning-effort <e> low / off / high / max\n"
+        "  --reasoning-effort <e> low / off / high / max; empty or default omits it\n"
         "  --patch <file>         extra --patch overlay (repeatable)\n"
         "  --retries <n>          total attempts on failure (default 1)\n"
         "  --retry-delay <sec>    delay between retries (default 2)\n"
@@ -867,8 +877,9 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (retries < 1) retries = 1;
     if (retry_delay < 0) retry_delay = 0;
+    if (effort && effort_blank(effort)) effort = NULL;
     if (effort && !effort_ok(effort)) {
-        write_err("dsh-subagent: reasoning-effort must be low/off/high/max.\n");
+        write_err("dsh-subagent: reasoning-effort must be low/off/high/max, or empty for the model default.\n");
         free(task);
         return 2;
     }

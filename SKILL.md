@@ -65,7 +65,7 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 
 - `--provider`：路由名，默认 `deepseek-official`（DeepSeek API-key 路由）。
 - `--model`：该 provider 下的模型 id。已知内置：`deepseek-flash`（默认，省额度首选）、`deepseek-chat`、`deepseek-v4-pro`；完整列表以 Web 模型页 / 官方 `/models` 列表为准。
-- `--reasoning-effort`：`low` / `off` / `high` / `max`（可选）。
+- `--reasoning-effort`：`low` / `off` / `high` / `max`。留空、纯空白，或字面量 `default`，都表示不填：patch 里不写 `reasoningEffort`。dsh 见到字段缺失时用该模型的 adapter 默认等级（`requested ?? defaultEffort`），不会把字符串 `default` 当成等级 id。
 
 等价的底层 `--patch` 文件（**provider 与 model 都必填**，缺一启动即失败）：
 
@@ -74,7 +74,7 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
   config:
     provider: deepseek-official
     model: deepseek-chat
-    reasoningEffort: high   # 可选
+    reasoningEffort: high   # 留空则整行不写，沿用模型默认等级
 ```
 
 ## 4. 模型不可用：fallback 阶梯
@@ -131,7 +131,7 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 | `--cwd <dir>` | 当前目录 | 子会话 workspace 根 |
 | `--provider <name>` | `deepseek-official` | provider 路由 |
 | `--model <id>` | `deepseek-flash` | 模型 id（仅当给出模型相关参数时生效） |
-| `--reasoning-effort <e>` | — | `low`/`off`/`high`/`max` |
+| `--reasoning-effort <e>` | 不填 | `low`/`off`/`high`/`max`；空或 `default` 表示沿用模型默认等级 |
 | `--patch <file>` | — | 额外 `--patch` 文件（可重复） |
 | `--retries <n>` | 1 | 失败重试总次数（网络波动建议 5） |
 | `--retry-delay <sec>` | 2 | 重试间隔秒数 |
