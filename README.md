@@ -59,7 +59,7 @@
 | `--cwd <dir>` | 当前目录 | 子会话的工作区根 |
 | `--provider <name>` | `deepseek-official` | provider 路由 |
 | `--model <id>` | `deepseek-flash` | 模型 id。和 `--provider` 一起才能确定一个模型 |
-| `--model-pool <provider>/<model>[/<effort>]` | — | 模型池的一项，可重复。失败并耗尽重试后才换下一项 |
+| `--model-pool <项>` | — | 模型池的一项，可重复。字段用竖线分开，模型 id 可以含 `/` |
 | `--reasoning-effort <e>` | 不填 | 只作用于 `--provider`/`--model`。空或 `default` 表示不写该字段，沿用模型默认等级 |
 | `--patch <file>` | — | 额外的 `--patch` 文件，可重复 |
 | `--retries <n>` | 1 | 失败后的总尝试次数。网络抖动建议 5 |
@@ -68,7 +68,7 @@
 
 覆盖模型时，调用器会写一份临时 patch。`agent-default-model` 的 `config` 是整体替换，所以 `provider` 和 `model` 会一起写上。思考等级留空时不写 `reasoningEffort`：dsh 只在这个字段缺失时使用该模型的 adapter 默认等级。字面量 `default` 同样按不填处理，不会写成 `reasoningEffort: default`。
 
-一个模型是 `provider` + `model`。模型池按这个组合列出多项，思考等级可选，写在该项的第三段，例如 `providerA/model1/high` 和 `providerA/model2`。调用器从第一项开始；某一项在 `--retries` 全部失败后才换下一项，并在 stderr 打印 `model pool switch`。池内换项要告诉用户，但这不是失败回退。整个池都失败后，才回退到 `deepseek-official`（先 `deepseek-flash`，已经试过则 `deepseek-chat`），再失败才改用外部 Agent 自己的 subagent。
+一个模型是 `provider` + `model`。模型池的一项写成 `provider|model` 或 `provider|model|effort`，例如 `providerA|model1|high` 和 `ark|volcengine/deepseek-v4.1-flash`。竖线只分隔字段，模型 id 里的 `/` 会原样保留。在 cmd 和 PowerShell 里整项要加引号，因为 `|` 是管道符。调用器从第一项开始；某一项在 `--retries` 全部失败后才换下一项，并在 stderr 打印 `model pool switch`。池内换项要告诉用户，但这不是失败回退。整个池都失败后，才回退到 `deepseek-official`（先 `deepseek-flash`，已经试过则 `deepseek-chat`），再失败才改用外部 Agent 自己的 subagent。
 
 ## 返回
 
@@ -87,13 +87,13 @@ dsh 自己的 stdout 是 NDJSON 事件流（`session`、`status`、`text`、`thi
 
 ## 版本
 
-当前版本是 **v1.0.0**。版本号只写在仓库根目录的 `VERSION` 里。`scripts\build.cmd` 读取它，生成 `scripts\version.h`，再编进 `dsh-subagent.exe`。
+当前版本是 **v1.0.1**。版本号只写在仓库根目录的 `VERSION` 里。`scripts\build.cmd` 读取它，生成 `scripts\version.h`，再编进 `dsh-subagent.exe`。
 
 ```bat
 scripts\dsh-subagent.exe --version
 ```
 
-输出 `dsh-subagent v1.0.0`。改版本时只改 `VERSION`，然后重新编译。
+输出 `dsh-subagent v1.0.1`。改版本时只改 `VERSION`，然后重新编译。
 
 ## 重新编译与测试
 

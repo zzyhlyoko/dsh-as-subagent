@@ -65,7 +65,7 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 
 - `--provider`：路由名，默认 `deepseek-official`（DeepSeek API-key 路由）。
 - `--model`：该 provider 下的模型 id。一个模型必须由 `provider` + `model` 一起确定。已知内置：`deepseek-flash`（默认，省额度首选）、`deepseek-chat`、`deepseek-v4-pro`；完整列表以 Web 模型页 / 官方 `/models` 列表为准。要按顺序尝试多个模型，用第 4 节的模型池，不要只重复写 `--model`。
-- `--reasoning-effort`：`low` / `off` / `high` / `max`。它只作用于 `--provider`/`--model` 这一项。留空、纯空白，或字面量 `default`，都表示不填：patch 里不写 `reasoningEffort`。dsh 见到字段缺失时用该模型的 adapter 默认等级（`requested ?? defaultEffort`），不会把字符串 `default` 当成等级 id。模型池里每一项的思考等级写在该项自己的第三段，不继承这个参数。
+- `--reasoning-effort`：`low` / `off` / `high` / `max`。它只作用于 `--provider`/`--model` 这一项。留空、纯空白，或字面量 `default`，都表示不填：patch 里不写 `reasoningEffort`。dsh 见到字段缺失时用该模型的 adapter 默认等级（`requested ?? defaultEffort`），不会把字符串 `default` 当成等级 id。模型池里每一项的思考等级写在该项自己的第三段，不继承这个参数。`--model` 的值可以包含 `/`，例如 `volcengine/deepseek-v4.1-flash`；那是模型 id 的一部分，不是 provider。
 
 等价的底层 `--patch` 文件（**provider 与 model 都必填**，缺一启动即失败）：
 
@@ -79,16 +79,16 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 
 ## 4. 模型池与失败回退
 
-一个模型永远是 `provider` + `model`。思考等级不参与区分模型，只是这一项的可选附加。池里的一项写成 `provider/model` 或 `provider/model/effort`，例如 `[providerA/model1/high, providerA/model2, providerB/model3, provider/model666/low]`。第三段只能是 `low` / `off` / `high` / `max`；不写、留空或写 `default` 都表示这一项不填 `reasoningEffort`。
+一个模型永远是 `provider` + `model`。思考等级不参与区分模型，只是这一项的可选附加。池里的一项用 `|` 分开字段，写成 `provider|model` 或 `provider|model|effort`。模型 id 可以包含 `/`，竖线不会去切它。例如 `[providerA|model1|high, providerA|model2, ark|volcengine/deepseek-v4.1-flash, route|model666|low]`。第三段只能是 `low` / `off` / `high` / `max`；不写、留空或写 `default` 都表示这一项不填 `reasoningEffort`。在 cmd 和 PowerShell 里整项要加引号，因为 `|` 是管道符。
 
 模型池是「指定模型」的扩展。一次调用把要尝试的模型按顺序交给调用器，调用器自己跑完整个池：
 
 ```powershell
 & $run --task $task --retries 5 `
-  --model-pool providerA/model1/high `
-  --model-pool providerA/model2 `
-  --model-pool providerB/model3 `
-  --model-pool provider/model666/low
+  --model-pool "providerA|model1|high" `
+  --model-pool "providerA|model2" `
+  --model-pool "ark|volcengine/deepseek-v4.1-flash" `
+  --model-pool "route|model666|low"
 ```
 
 也可以先用 `--provider` 和 `--model`（以及可选的 `--reasoning-effort`）写第一项，再用重复的 `--model-pool` 追加后面的项。`--reasoning-effort` 不会套到没写第三段的池项上。
@@ -135,7 +135,7 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 | `--cwd <dir>` | 当前目录 | 子会话 workspace 根 |
 | `--provider <name>` | `deepseek-official` | provider 路由 |
 | `--model <id>` | `deepseek-flash` | 模型 id。和 `--provider` 一起才能确定一个模型 |
-| `--model-pool <provider>/<model>[/<effort>]` | — | 模型池的一项，可重复。顺序即尝试顺序；第三段只作用于该项 |
+| `--model-pool <项>` | — | 模型池的一项，可重复。顺序即尝试顺序。字段用竖线分开，模型 id 可以含 `/`；第三段只作用于该项 |
 | `--reasoning-effort <e>` | 不填 | 只作用于 `--provider`/`--model`。`low`/`off`/`high`/`max`；空或 `default` 表示沿用模型默认等级 |
 | `--patch <file>` | — | 额外 `--patch` 文件（可重复） |
 | `--retries <n>` | 1 | 失败重试总次数（网络波动建议 5） |

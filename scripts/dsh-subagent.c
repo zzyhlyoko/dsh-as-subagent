@@ -215,24 +215,25 @@ static int effort_blank(const wchar_t *s) {
     return blank;
 }
 
-/* provider/model or provider/model/effort. The third segment is optional and
- * belongs only to this entry. Blank or "default" omits reasoningEffort. */
+/* provider|model or provider|model|effort. '|' separates the fields so a
+ * model id may contain '/'. The effort field is optional and belongs only to
+ * this entry. Blank or "default" omits reasoningEffort. */
 static int parse_pool_entry(const wchar_t *s, wchar_t **prov, wchar_t **mod, wchar_t **effort) {
     wchar_t *t = wtrim_dup(s ? s : L"");
-    wchar_t *slash1 = wcschr(t, L'/');
-    if (!slash1) { free(t); return 0; }
-    *slash1 = 0;
-    wchar_t *slash2 = wcschr(slash1 + 1, L'/');
-    if (slash2) {
-        *slash2 = 0;
-        if (wcschr(slash2 + 1, L'/')) { free(t); return 0; }
+    wchar_t *bar1 = wcschr(t, L'|');
+    if (!bar1) { free(t); return 0; }
+    *bar1 = 0;
+    wchar_t *bar2 = wcschr(bar1 + 1, L'|');
+    if (bar2) {
+        *bar2 = 0;
+        if (wcschr(bar2 + 1, L'|')) { free(t); return 0; }
     }
     wchar_t *p = wtrim_dup(t);
-    wchar_t *m = wtrim_dup(slash1 + 1);
+    wchar_t *m = wtrim_dup(bar1 + 1);
     wchar_t *e = NULL;
     int ok = p[0] && m[0];
-    if (ok && slash2) {
-        wchar_t *et = wtrim_dup(slash2 + 1);
+    if (ok && bar2) {
+        wchar_t *et = wtrim_dup(bar2 + 1);
         if (!et[0] || effort_blank(et)) free(et);
         else if (!effort_ok(et)) { free(et); ok = 0; }
         else e = et;
@@ -822,7 +823,7 @@ static void print_help(void) {
         "  --cwd <dir>            working directory for the child session\n"
         "  --provider <name>      provider route (default deepseek-official)\n"
         "  --model <id>           model id (default deepseek-flash when overriding)\n"
-        "  --model-pool <p>/<m>[/<e>]  pool entry, repeatable; effort is optional per entry\n"
+        "  --model-pool <p>|<m>[|<e>]  pool entry, repeatable; '|' separates fields so model may contain '/'\n"
         "  --reasoning-effort <e> low / off / high / max; empty or default omits it\n"
         "  --patch <file>         extra --patch overlay (repeatable)\n"
         "  --retries <n>          total attempts on failure (default 1)\n"
@@ -833,8 +834,9 @@ static void print_help(void) {
 }
 
 static const char POOL_ENTRY_ERR[] =
-    "dsh-subagent: model-pool entry must be provider/model or provider/model/effort "
-    "(effort is low/off/high/max; omit it for the model default).\n";
+    "dsh-subagent: model-pool entry must be provider|model or provider|model|effort "
+    "(effort is low/off/high/max; omit it for the model default). "
+    "Use '|' between fields so a model id may contain '/'.\n";
 
 static int write_model_patch(const wchar_t *path, const wchar_t *provider, const wchar_t *model, const wchar_t *effort) {
     char *prov = wide_to_utf8(provider);
@@ -882,11 +884,11 @@ static void buf_model_ref(Buf *b, const ModelRef *model) {
     char *p = wide_to_utf8(model->provider);
     char *m = wide_to_utf8(model->model);
     buf_str(b, p);
-    buf_str(b, "/");
+    buf_str(b, "|");
     buf_str(b, m);
     if (model->effort && model->effort[0]) {
         char *e = wide_to_utf8(model->effort);
-        buf_str(b, "/");
+        buf_str(b, "|");
         buf_str(b, e);
         free(e);
     }
@@ -1049,7 +1051,7 @@ int wmain(int argc, wchar_t **argv) {
             wstrdup(L"deepseek-flash"),
             wstrdup(effort));
     } else if (models.n > 0 && effort) {
-        write_err("dsh-subagent: reasoning-effort applies to --provider/--model; put per-model effort in --model-pool as provider/model/effort.\n");
+        write_err("dsh-subagent: reasoning-effort applies to --provider/--model; put per-model effort in --model-pool as provider|model|effort.\n");
         free(task);
         model_list_free(&models);
         return 2;

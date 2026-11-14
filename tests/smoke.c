@@ -482,7 +482,7 @@ static void check_no_patch(const Result *r) {
 static void check_pool_bad(const Result *r) {
     require(r->code == 2, "exit");
     require(calls(r) == 0, "launched");
-    require(contains(r->err, "provider/model"), "stderr");
+    require(contains(r->err, "provider|model"), "stderr");
 }
 static void check_pool_effort_flag(const Result *r) {
     require(r->code == 2, "exit");
@@ -505,6 +505,22 @@ static void check_pool_omit_effort(const Result *r) {
     require(line_has(r->log, 0, "model: model2"), "model");
     require(!line_has(r->log, 0, "reasoningEffort"), "omitted");
 }
+static void check_pool_slash_model(const Result *r) {
+    require(r->code == 0, "exit");
+    require(calls(r) == 1, "calls");
+    require(line_has(r->log, 0, "provider: ark"), "provider");
+    require(!line_has(r->log, 0, "provider: volcengine"), "slash is not the provider");
+    require(line_has(r->log, 0, "model: volcengine/deepseek-v4.1-flash"), "model");
+    require(line_has(r->log, 0, "reasoningEffort: high"), "effort");
+}
+static void check_model_slash(const Result *r) {
+    require(r->code == 0, "exit");
+    require(calls(r) == 1, "calls");
+    require(contains(r->log, "provider: ark"), "provider");
+    require(!contains(r->log, "provider: volcengine"), "slash is not the provider");
+    require(contains(r->log, "model: volcengine/deepseek-v4.1-flash"), "model");
+    require(!contains(r->log, "reasoningEffort"), "omitted");
+}
 static void summary_is(const Result *r, int code, const char *session, const char *answer);
 
 static void check_pool_switch(const Result *r) {
@@ -517,7 +533,7 @@ static void check_pool_switch(const Result *r) {
     require(line_has(r->log, 1, "model: model2"), "second model");
     require(!line_has(r->log, 1, "reasoningEffort"), "second omits effort");
     require(line_has(r->log, 1, "\"stdin\":\"t\""), "second stdin");
-    require(contains(r->err, "model pool switch 2/2 from providerA/model1/high to providerA/model2 after 1 failed attempts."), "switch");
+    require(contains(r->err, "model pool switch 2/2 from providerA|model1|high to providerA|model2 after 1 failed attempts."), "switch");
     require(!contains(r->err, "fallback"), "not a fallback");
     summary_is(r, 0, "session-ok", "ok-answer");
 }
@@ -531,7 +547,7 @@ static void check_pool_retry_then_switch(const Result *r) {
     require(!line_has(r->log, 1, "reasoningEffort"), "no effort");
     require(line_has(r->log, 2, "model: model3"), "next");
     require(line_has(r->log, 2, "reasoningEffort: max"), "next effort");
-    require(contains(r->err, "model pool switch 2/2 from providerA/model1 to providerB/model3/max after 2 failed attempts."), "switch");
+    require(contains(r->err, "model pool switch 2/2 from providerA|model1 to providerB|model3|max after 2 failed attempts."), "switch");
 }
 static void check_pool_exhausted(const Result *r) {
     require(r->code == 1, "exit");
@@ -545,9 +561,9 @@ static void check_pool_exhausted(const Result *r) {
     require(line_has(r->log, 3, "model: model666"), "m4");
     require(line_has(r->log, 3, "reasoningEffort: low"), "e4");
     require(!contains(r->log, "deepseek-official"), "no official fallback");
-    require(contains(r->err, "model pool switch 2/4 from providerA/model1/high to providerA/model2 after 1 failed attempts."), "switch2");
-    require(contains(r->err, "model pool switch 3/4 from providerA/model2 to providerB/model3 after 1 failed attempts."), "switch3");
-    require(contains(r->err, "model pool switch 4/4 from providerB/model3 to provider/model666/low after 1 failed attempts."), "switch4");
+    require(contains(r->err, "model pool switch 2/4 from providerA|model1|high to providerA|model2 after 1 failed attempts."), "switch2");
+    require(contains(r->err, "model pool switch 3/4 from providerA|model2 to providerB|model3 after 1 failed attempts."), "switch3");
+    require(contains(r->err, "model pool switch 4/4 from providerB|model3 to route|model666|low after 1 failed attempts."), "switch4");
     require(!contains(r->err, "fallback"), "not a fallback");
     summary_is(r, 1, "session-fail-4", NULL);
 }
@@ -560,7 +576,7 @@ static void check_pool_primary_first(const Result *r) {
     require(line_has(r->log, 1, "provider: providerB"), "second provider");
     require(line_has(r->log, 1, "model: model3"), "second model");
     require(!line_has(r->log, 1, "reasoningEffort"), "second omits effort");
-    require(contains(r->err, "model pool switch 2/2 from providerA/model1/low to providerB/model3 after 1 failed attempts."), "switch");
+    require(contains(r->err, "model pool switch 2/2 from providerA|model1|low to providerB|model3 after 1 failed attempts."), "switch");
 }
 static char *args_joined(const Result *r) {
     const char *line = nth_line(r->log, 0);
@@ -975,23 +991,26 @@ int wmain(int argc, wchar_t **argv) {
     add("exe default retries stops after one failure", "--task t", "", "fail-then-ok", 5, 0, check_fail_once);
     add("exe third attempt is the one that is kept", "--task again --retries 3 --retry-delay 0", "", "fail-then-ok", 2, 0, check_retry_ok);
     add("exe exhausted retries keep the last attempt", "--task t --retries 2 --retry-delay 0", "", "fail-then-ok", 5, 0, check_retry_exhausted);
-    add("exe model-pool without a slash", "--task t --model-pool noslash", "", "ok", 0, 1, check_pool_bad);
-    add("exe model-pool missing provider", "--task t --model-pool /model1", "", "ok", 0, 1, check_pool_bad);
-    add("exe model-pool missing model", "--task t --model-pool providerA/", "", "ok", 0, 1, check_pool_bad);
+    add("exe model-pool without a pipe", "--task t --model-pool noslash", "", "ok", 0, 1, check_pool_bad);
+    add("exe model-pool old slash form is rejected", "--task t --model-pool providerA/volcengine/deepseek-v4.1-flash", "", "ok", 0, 1, check_pool_bad);
+    add("exe model-pool missing provider", "--task t --model-pool |model1", "", "ok", 0, 1, check_pool_bad);
+    add("exe model-pool missing model", "--task t --model-pool providerA|", "", "ok", 0, 1, check_pool_bad);
     add("exe model-pool empty entry", "--task t --model-pool \"\"", "", "ok", 0, 1, check_pool_bad);
     add("exe model-pool missing value", "--task t --model-pool", "", "ok", 0, 1, check_pool_bad);
-    add("exe model-pool four segments", "--task t --model-pool providerA/model1/high/extra", "", "ok", 0, 1, check_pool_bad);
-    add("exe model-pool bad effort", "--task t --model-pool providerA/model1/HIGH", "", "ok", 0, 1, check_pool_bad);
-    add("exe model-pool one entry keeps its own effort", "--task t --model-pool providerA/model1/high", "", "ok", 0, 0, check_pool_one);
-    add("exe model-pool default effort is omitted", "--task t --model-pool providerA/model2/default", "", "ok", 0, 0, check_pool_omit_effort);
-    add("exe model-pool trailing slash omits effort", "--task t --model-pool providerA/model2/", "", "ok", 0, 0, check_pool_omit_effort);
-    add("exe model-pool trims each segment", "--task t --model-pool \"  providerA  /  model2  /  default  \"", "", "ok", 0, 0, check_pool_omit_effort);
-    add("exe model-pool stops after the first success", "--task t --model-pool providerA/model1/high --model-pool providerA/model2", "", "ok", 0, 0, check_pool_one);
-    add("exe model-pool switches after retries are exhausted", "--task t --retries 1 --retry-delay 0 --model-pool providerA/model1/high --model-pool providerA/model2", "", "fail-then-ok", 1, 0, check_pool_switch);
-    add("exe model-pool retries the same entry before switching", "--task t --retries 2 --retry-delay 0 --model-pool providerA/model1 --model-pool providerB/model3/max", "", "fail-then-ok", 2, 0, check_pool_retry_then_switch);
-    add("exe model-pool exhaustion does not invent deepseek-official", "--task t --retries 1 --retry-delay 0 --model-pool providerA/model1/high --model-pool providerA/model2 --model-pool providerB/model3 --model-pool provider/model666/low", "", "fail-then-ok", 9, 0, check_pool_exhausted);
-    add("exe --model is the first pool entry", "--task t --retries 1 --retry-delay 0 --provider providerA --model model1 --reasoning-effort low --model-pool providerB/model3", "", "fail-then-ok", 1, 0, check_pool_primary_first);
-    add("exe global reasoning-effort does not cover a pool entry", "--task t --reasoning-effort high --model-pool providerA/model2", "", "ok", 0, 1, check_pool_effort_flag);
+    add("exe model-pool four segments", "--task t --model-pool providerA|model1|high|extra", "", "ok", 0, 1, check_pool_bad);
+    add("exe model-pool bad effort", "--task t --model-pool providerA|model1|HIGH", "", "ok", 0, 1, check_pool_bad);
+    add("exe model-pool one entry keeps its own effort", "--task t --model-pool providerA|model1|high", "", "ok", 0, 0, check_pool_one);
+    add("exe model-pool default effort is omitted", "--task t --model-pool providerA|model2|default", "", "ok", 0, 0, check_pool_omit_effort);
+    add("exe model-pool trailing pipe omits effort", "--task t --model-pool providerA|model2|", "", "ok", 0, 0, check_pool_omit_effort);
+    add("exe model-pool trims each segment", "--task t --model-pool \"  providerA  |  model2  |  default  \"", "", "ok", 0, 0, check_pool_omit_effort);
+    add("exe model-pool keeps a slash inside the model id", "--task t --model-pool ark|volcengine/deepseek-v4.1-flash|high", "", "ok", 0, 0, check_pool_slash_model);
+    add("exe --model keeps a slash inside the model id", "--task t --provider ark --model volcengine/deepseek-v4.1-flash", "", "ok", 0, 0, check_model_slash);
+    add("exe model-pool stops after the first success", "--task t --model-pool providerA|model1|high --model-pool providerA|model2", "", "ok", 0, 0, check_pool_one);
+    add("exe model-pool switches after retries are exhausted", "--task t --retries 1 --retry-delay 0 --model-pool providerA|model1|high --model-pool providerA|model2", "", "fail-then-ok", 1, 0, check_pool_switch);
+    add("exe model-pool retries the same entry before switching", "--task t --retries 2 --retry-delay 0 --model-pool providerA|model1 --model-pool providerB|model3|max", "", "fail-then-ok", 2, 0, check_pool_retry_then_switch);
+    add("exe model-pool exhaustion does not invent deepseek-official", "--task t --retries 1 --retry-delay 0 --model-pool providerA|model1|high --model-pool providerA|model2 --model-pool providerB|model3 --model-pool route|model666|low", "", "fail-then-ok", 9, 0, check_pool_exhausted);
+    add("exe --model is the first pool entry", "--task t --retries 1 --retry-delay 0 --provider providerA --model model1 --reasoning-effort low --model-pool providerB|model3", "", "fail-then-ok", 1, 0, check_pool_primary_first);
+    add("exe global reasoning-effort does not cover a pool entry", "--task t --reasoning-effort high --model-pool providerA|model2", "", "ok", 0, 1, check_pool_effort_flag);
 
     check_imports();
     int i;
