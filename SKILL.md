@@ -64,8 +64,8 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 ```
 
 - `--provider`：路由名，默认 `deepseek-official`（DeepSeek API-key 路由）。
-- `--model`：该 provider 下的模型 id。已知内置：`deepseek-flash`（默认，省额度首选）、`deepseek-chat`、`deepseek-v4-pro`；完整列表以 Web 模型页 / 官方 `/models` 列表为准。
-- `--reasoning-effort`：`low` / `off` / `high` / `max`。留空、纯空白，或字面量 `default`，都表示不填：patch 里不写 `reasoningEffort`。dsh 见到字段缺失时用该模型的 adapter 默认等级（`requested ?? defaultEffort`），不会把字符串 `default` 当成等级 id。
+- `--model`：该 provider 下的模型 id。一个模型必须由 `provider` + `model` 一起确定。已知内置：`deepseek-flash`（默认，省额度首选）、`deepseek-chat`、`deepseek-v4-pro`；完整列表以 Web 模型页 / 官方 `/models` 列表为准。要按顺序尝试多个模型，用第 4 节的模型池，不要只重复写 `--model`。
+- `--reasoning-effort`：`low` / `off` / `high` / `max`。它只作用于 `--provider`/`--model` 这一项。留空、纯空白，或字面量 `default`，都表示不填：patch 里不写 `reasoningEffort`。dsh 见到字段缺失时用该模型的 adapter 默认等级（`requested ?? defaultEffort`），不会把字符串 `default` 当成等级 id。模型池里每一项的思考等级写在该项自己的第三段，不继承这个参数。
 
 等价的底层 `--patch` 文件（**provider 与 model 都必填**，缺一启动即失败）：
 
@@ -77,26 +77,30 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
     reasoningEffort: high   # 留空则整行不写，沿用模型默认等级
 ```
 
-## 4. 模型不可用：fallback 阶梯
+## 4. 模型池与失败回退
 
-按顺序执行；**每发生一次 fallback（换模型/换 provider），都要明确告知用户**（试了哪些、为什么、现在用哪个）。
+一个模型永远是 `provider` + `model`。思考等级不参与区分模型，只是这一项的可选附加。池里的一项写成 `provider/model` 或 `provider/model/effort`，例如 `[providerA/model1/high, providerA/model2, providerB/model3, provider/model666/low]`。第三段只能是 `low` / `off` / `high` / `max`；不写、留空或写 `default` 都表示这一项不填 `reasoningEffort`。
 
-1. 用指定模型跑，**最多重试 5 次**（应对网络波动等瞬态故障）：
-   ```powershell
-   & $run --task $task --provider <p> --model <m1> --retries 5
-   ```
-2. 仍失败 → **同 provider 下换其它模型**，逐个重试（各 `--retries 5`）：
-   ```powershell
-   & $run --task $task --provider <p> --model <m2> --retries 5
-   & $run --task $task --provider <p> --model <m3> --retries 5
-   ```
-3. 仍失败 → **切回 deepseek-official** 再重试：
-   ```powershell
-   & $run --task $task --model deepseek-chat --retries 5   # 或 deepseek-flash
-   ```
-4. 仍失败 → **放弃 dsh，改用你（外部 Agent）自己的 subagent 兜底**，并向用户说明原因。
+模型池是「指定模型」的扩展。一次调用把要尝试的模型按顺序交给调用器，调用器自己跑完整个池：
 
-判定「不可用」的信号：`exitCode` 非 0，且 `reason.error.code` 为 `MISSING_CREDENTIAL` / `MODEL_UNSUPPORTED` / `CLIENT_UPGRADE_REQUIRED` 或网络超时/5xx 等，或 stderr 有 `dsh: <code>: <message>` 行。
+```powershell
+& $run --task $task --retries 5 `
+  --model-pool providerA/model1/high `
+  --model-pool providerA/model2 `
+  --model-pool providerB/model3 `
+  --model-pool provider/model666/low
+```
+
+也可以先用 `--provider` 和 `--model`（以及可选的 `--reasoning-effort`）写第一项，再用重复的 `--model-pool` 追加后面的项。`--reasoning-effort` 不会套到没写第三段的池项上。
+
+1. 从第一项开始。失败后只重试**当前项**，次数是 `--retries`（网络波动建议 5）。重试还没耗尽时不换模型。
+2. 当前项的重试全部失败后，才换池中的下一项。这是池内切换，**不是失败回退**。stderr 有一行 `dsh-subagent: model pool switch ...`。告诉用户上一项在重试后失败、现在改用池里的下一项，但警告等级要低于回退：不要把它叫作 fallback，也不要建议放弃 dsh。
+3. 整个池都失败后，才发生回退。直接改用 `deepseek-official`，并按平常的回退警告告诉用户（试过哪些、为什么、现在用哪个）。优先 `--provider deepseek-official --model deepseek-flash`；这个组合已经在池里失败过时，改用 `--model deepseek-chat`；两个都试过就跳过这一步。回退这一次同样带 `--retries 5`。
+4. 这一步再失败 → **放弃 dsh，改用你（外部 Agent）自己的 subagent 兜底**，并向用户说明原因。
+
+只指定了一个模型时，它就是只有一项的池：重试耗尽后直接进入第 3 步。不要自行猜测同一 provider 下的其它模型；用户要按顺序尝试多个模型，就把它们放进模型池。
+
+判定某一项「失败」的信号：该次执行 `exitCode` 非 0，且 `reason.error.code` 为 `MISSING_CREDENTIAL` / `MODEL_UNSUPPORTED` / `CLIENT_UPGRADE_REQUIRED` 或网络超时/5xx 等，或 stderr 有 `dsh: <code>: <message>` 行。`model pool switch` 行不是这个信号。
 
 ## 5. 续接会话 + 变更本次模型
 
@@ -117,7 +121,7 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 
 ## 7. 失败报告与优雅降级
 
-- 子进程以任何方式中途失败：从返回 JSON 的 `exitCode` / `reason` / `error` 与 stderr 的 `dsh:` 行提取原因，**告知用户**。
+- 子进程以任何方式中途失败：从返回 JSON 的 `exitCode` / `reason` / `error` 与 stderr 的 `dsh:` 行提取原因，**告知用户**。stderr 里的 `model pool switch` 只是池内换下一项，按第 4 节的较低警告转告，不要当成失败回退。
 - **不要因此撂挑子**：按第 4 节阶梯 fallback，最终兜底 = 你（外部 Agent）自己的 subagent；哪怕 dsh 完全不可用，也要把任务接回来完成或明确上报阻塞。
 
 ## 8. 调用器参数
@@ -130,12 +134,14 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 | `--session-id <id>` | — | 续接已持久化会话 |
 | `--cwd <dir>` | 当前目录 | 子会话 workspace 根 |
 | `--provider <name>` | `deepseek-official` | provider 路由 |
-| `--model <id>` | `deepseek-flash` | 模型 id（仅当给出模型相关参数时生效） |
-| `--reasoning-effort <e>` | 不填 | `low`/`off`/`high`/`max`；空或 `default` 表示沿用模型默认等级 |
+| `--model <id>` | `deepseek-flash` | 模型 id。和 `--provider` 一起才能确定一个模型 |
+| `--model-pool <provider>/<model>[/<effort>]` | — | 模型池的一项，可重复。顺序即尝试顺序；第三段只作用于该项 |
+| `--reasoning-effort <e>` | 不填 | 只作用于 `--provider`/`--model`。`low`/`off`/`high`/`max`；空或 `default` 表示沿用模型默认等级 |
 | `--patch <file>` | — | 额外 `--patch` 文件（可重复） |
 | `--retries <n>` | 1 | 失败重试总次数（网络波动建议 5） |
 | `--retry-delay <sec>` | 2 | 重试间隔秒数 |
 | `--raw` | — | 只输出最终答案，不输出 JSON |
+| `--version` | — | 打印 `dsh-subagent` 加 `VERSION` 文件里的版本号，然后退出 |
 
 ## 9. 输出契约（基础）
 

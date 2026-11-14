@@ -22,6 +22,7 @@ static wchar_t g_saved_path[32768];
 static char g_user_patch_utf8[MAX_PATH * 3];
 static char g_missing_patch_utf8[MAX_PATH * 3];
 static char g_child_cwd_utf8[MAX_PATH * 3];
+static char g_version_out[160];
 
 static void *xmalloc(size_t n) {
     void *p = malloc(n ? n : 1);
@@ -342,6 +343,18 @@ static char *stdin_of(const Result *r, int index) {
 
 static int calls(const Result *r) { return line_count(r->log); }
 
+static int line_has(const char *log, int index, const char *frag) {
+    const char *line = nth_line(log, index);
+    if (!line || !frag) return 0;
+    const char *nl = strchr(line, '\n');
+    size_t n = nl ? (size_t)(nl - line) : strlen(line);
+    size_t m = strlen(frag);
+    size_t i;
+    if (m == 0 || m > n) return 0;
+    for (i = 0; i + m <= n; i++) if (memcmp(line + i, frag, m) == 0) return 1;
+    return 0;
+}
+
 typedef struct {
     const char *name;
     wchar_t *cmd;
@@ -384,6 +397,11 @@ static void check_effort_bad(const Result *r) {
     require(r->code == 2, "exit");
     require(calls(r) == 0, "launched");
     require(contains(r->err, "low/off/high/max"), "stderr");
+}
+static void check_version(const Result *r) {
+    require(r->code == 0, "exit");
+    require(calls(r) == 0, "launched");
+    require(strcmp(r->out, g_version_out) == 0, "version");
 }
 static void check_help(const Result *r) {
     require(r->code == 0, "exit");
@@ -460,6 +478,89 @@ static void check_no_patch(const Result *r) {
     require(calls(r) == 1, "calls");
     require(!contains(r->log, "agent-default-model"), "unexpected patch");
     require(contains(r->log, "\"patches\":[]"), "empty patches");
+}
+static void check_pool_bad(const Result *r) {
+    require(r->code == 2, "exit");
+    require(calls(r) == 0, "launched");
+    require(contains(r->err, "provider/model"), "stderr");
+}
+static void check_pool_effort_flag(const Result *r) {
+    require(r->code == 2, "exit");
+    require(calls(r) == 0, "launched");
+    require(contains(r->err, "reasoning-effort applies to --provider/--model"), "stderr");
+}
+static void check_pool_one(const Result *r) {
+    require(r->code == 0, "exit");
+    require(calls(r) == 1, "calls");
+    require(!contains(r->err, "model pool switch"), "no switch");
+    require(line_has(r->log, 0, "provider: providerA"), "provider");
+    require(line_has(r->log, 0, "model: model1"), "model");
+    require(line_has(r->log, 0, "reasoningEffort: high"), "effort");
+    require(!line_has(r->log, 0, "deepseek-flash"), "no implicit model");
+}
+static void check_pool_omit_effort(const Result *r) {
+    require(r->code == 0, "exit");
+    require(calls(r) == 1, "calls");
+    require(line_has(r->log, 0, "provider: providerA"), "provider");
+    require(line_has(r->log, 0, "model: model2"), "model");
+    require(!line_has(r->log, 0, "reasoningEffort"), "omitted");
+}
+static void summary_is(const Result *r, int code, const char *session, const char *answer);
+
+static void check_pool_switch(const Result *r) {
+    require(r->code == 0, "exit");
+    require(calls(r) == 2, "calls");
+    require(line_has(r->log, 0, "model: model1"), "first model");
+    require(line_has(r->log, 0, "reasoningEffort: high"), "first effort");
+    require(line_has(r->log, 0, "\"stdin\":\"t\""), "first stdin");
+    require(line_has(r->log, 1, "provider: providerA"), "second provider");
+    require(line_has(r->log, 1, "model: model2"), "second model");
+    require(!line_has(r->log, 1, "reasoningEffort"), "second omits effort");
+    require(line_has(r->log, 1, "\"stdin\":\"t\""), "second stdin");
+    require(contains(r->err, "model pool switch 2/2 from providerA/model1/high to providerA/model2 after 1 failed attempts."), "switch");
+    require(!contains(r->err, "fallback"), "not a fallback");
+    summary_is(r, 0, "session-ok", "ok-answer");
+}
+static void check_pool_retry_then_switch(const Result *r) {
+    require(r->code == 0, "exit");
+    require(calls(r) == 3, "calls");
+    require(contains(r->err, "attempt 1/2 failed"), "retry");
+    require(!contains(r->err, "attempt 2/2"), "no retry line for the switch");
+    require(line_has(r->log, 0, "model: model1"), "first");
+    require(line_has(r->log, 1, "model: model1"), "retry stays");
+    require(!line_has(r->log, 1, "reasoningEffort"), "no effort");
+    require(line_has(r->log, 2, "model: model3"), "next");
+    require(line_has(r->log, 2, "reasoningEffort: max"), "next effort");
+    require(contains(r->err, "model pool switch 2/2 from providerA/model1 to providerB/model3/max after 2 failed attempts."), "switch");
+}
+static void check_pool_exhausted(const Result *r) {
+    require(r->code == 1, "exit");
+    require(calls(r) == 4, "calls");
+    require(line_has(r->log, 0, "model: model1"), "m1");
+    require(line_has(r->log, 0, "reasoningEffort: high"), "e1");
+    require(line_has(r->log, 1, "model: model2"), "m2");
+    require(!line_has(r->log, 1, "reasoningEffort"), "e2");
+    require(line_has(r->log, 2, "provider: providerB"), "m3 provider");
+    require(line_has(r->log, 2, "model: model3"), "m3");
+    require(line_has(r->log, 3, "model: model666"), "m4");
+    require(line_has(r->log, 3, "reasoningEffort: low"), "e4");
+    require(!contains(r->log, "deepseek-official"), "no official fallback");
+    require(contains(r->err, "model pool switch 2/4 from providerA/model1/high to providerA/model2 after 1 failed attempts."), "switch2");
+    require(contains(r->err, "model pool switch 3/4 from providerA/model2 to providerB/model3 after 1 failed attempts."), "switch3");
+    require(contains(r->err, "model pool switch 4/4 from providerB/model3 to provider/model666/low after 1 failed attempts."), "switch4");
+    require(!contains(r->err, "fallback"), "not a fallback");
+    summary_is(r, 1, "session-fail-4", NULL);
+}
+static void check_pool_primary_first(const Result *r) {
+    require(r->code == 0, "exit");
+    require(calls(r) == 2, "calls");
+    require(line_has(r->log, 0, "provider: providerA"), "first provider");
+    require(line_has(r->log, 0, "model: model1"), "first model");
+    require(line_has(r->log, 0, "reasoningEffort: low"), "first effort");
+    require(line_has(r->log, 1, "provider: providerB"), "second provider");
+    require(line_has(r->log, 1, "model: model3"), "second model");
+    require(!line_has(r->log, 1, "reasoningEffort"), "second omits effort");
+    require(contains(r->err, "model pool switch 2/2 from providerA/model1/low to providerB/model3 after 1 failed attempts."), "switch");
 }
 static char *args_joined(const Result *r) {
     const char *line = nth_line(r->log, 0);
@@ -703,6 +804,23 @@ int wmain(int argc, wchar_t **argv) {
     SetConsoleOutputCP(CP_UTF8);
     wcscpy(g_exe, argv[1]);
     wcscat(g_exe, L"\\scripts\\dsh-subagent.exe");
+    {
+        wchar_t ver_path[MAX_PATH];
+        wcscpy(ver_path, argv[1]);
+        wcscat(ver_path, L"\\VERSION");
+        HANDLE vh = CreateFileW(ver_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        char raw[64];
+        DWORD got = 0;
+        memset(raw, 0, sizeof raw);
+        if (vh != INVALID_HANDLE_VALUE) {
+            ReadFile(vh, raw, (DWORD)sizeof raw - 1, &got, NULL);
+            CloseHandle(vh);
+        }
+        raw[got] = 0;
+        int n = (int)strlen(raw);
+        while (n && (raw[n - 1] == '\n' || raw[n - 1] == '\r' || raw[n - 1] == ' ')) raw[--n] = 0;
+        sprintf(g_version_out, "dsh-subagent %s\n", raw);
+    }
     GetEnvironmentVariableW(L"PATH", g_saved_path, 32768);
 
     wchar_t temp[MAX_PATH];
@@ -786,6 +904,8 @@ int wmain(int argc, wchar_t **argv) {
     add("exe empty reasoning-effort alone writes no patch", "--task t --reasoning-effort \"\"", "", "ok", 0, 0, check_no_patch);
     add("exe reasoning-effort default alone writes no patch", "--task t --reasoning-effort default", "", "ok", 0, 0, check_no_patch);
     add("exe missing reasoning-effort value omits the field", "--task t --model deepseek-chat --reasoning-effort", "", "ok", 0, 0, check_model_chat);
+    add("exe --version prints VERSION", "--version", "", "ok", 0, 1, check_version);
+    add("exe --version does not run a task", "--task t --version", "", "ok", 0, 1, check_version);
     add("exe --help", "--help", "", "ok", 0, 1, check_help);
     add("exe -h", "-h", "", "ok", 0, 1, check_help);
     add("exe PATH has no dsh install", "--task t", "", "ok", 0, 1, check_no_install);
@@ -855,6 +975,23 @@ int wmain(int argc, wchar_t **argv) {
     add("exe default retries stops after one failure", "--task t", "", "fail-then-ok", 5, 0, check_fail_once);
     add("exe third attempt is the one that is kept", "--task again --retries 3 --retry-delay 0", "", "fail-then-ok", 2, 0, check_retry_ok);
     add("exe exhausted retries keep the last attempt", "--task t --retries 2 --retry-delay 0", "", "fail-then-ok", 5, 0, check_retry_exhausted);
+    add("exe model-pool without a slash", "--task t --model-pool noslash", "", "ok", 0, 1, check_pool_bad);
+    add("exe model-pool missing provider", "--task t --model-pool /model1", "", "ok", 0, 1, check_pool_bad);
+    add("exe model-pool missing model", "--task t --model-pool providerA/", "", "ok", 0, 1, check_pool_bad);
+    add("exe model-pool empty entry", "--task t --model-pool \"\"", "", "ok", 0, 1, check_pool_bad);
+    add("exe model-pool missing value", "--task t --model-pool", "", "ok", 0, 1, check_pool_bad);
+    add("exe model-pool four segments", "--task t --model-pool providerA/model1/high/extra", "", "ok", 0, 1, check_pool_bad);
+    add("exe model-pool bad effort", "--task t --model-pool providerA/model1/HIGH", "", "ok", 0, 1, check_pool_bad);
+    add("exe model-pool one entry keeps its own effort", "--task t --model-pool providerA/model1/high", "", "ok", 0, 0, check_pool_one);
+    add("exe model-pool default effort is omitted", "--task t --model-pool providerA/model2/default", "", "ok", 0, 0, check_pool_omit_effort);
+    add("exe model-pool trailing slash omits effort", "--task t --model-pool providerA/model2/", "", "ok", 0, 0, check_pool_omit_effort);
+    add("exe model-pool trims each segment", "--task t --model-pool \"  providerA  /  model2  /  default  \"", "", "ok", 0, 0, check_pool_omit_effort);
+    add("exe model-pool stops after the first success", "--task t --model-pool providerA/model1/high --model-pool providerA/model2", "", "ok", 0, 0, check_pool_one);
+    add("exe model-pool switches after retries are exhausted", "--task t --retries 1 --retry-delay 0 --model-pool providerA/model1/high --model-pool providerA/model2", "", "fail-then-ok", 1, 0, check_pool_switch);
+    add("exe model-pool retries the same entry before switching", "--task t --retries 2 --retry-delay 0 --model-pool providerA/model1 --model-pool providerB/model3/max", "", "fail-then-ok", 2, 0, check_pool_retry_then_switch);
+    add("exe model-pool exhaustion does not invent deepseek-official", "--task t --retries 1 --retry-delay 0 --model-pool providerA/model1/high --model-pool providerA/model2 --model-pool providerB/model3 --model-pool provider/model666/low", "", "fail-then-ok", 9, 0, check_pool_exhausted);
+    add("exe --model is the first pool entry", "--task t --retries 1 --retry-delay 0 --provider providerA --model model1 --reasoning-effort low --model-pool providerB/model3", "", "fail-then-ok", 1, 0, check_pool_primary_first);
+    add("exe global reasoning-effort does not cover a pool entry", "--task t --reasoning-effort high --model-pool providerA/model2", "", "ok", 0, 1, check_pool_effort_flag);
 
     check_imports();
     int i;

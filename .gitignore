@@ -1,2 +1,5 @@
 # Local reference checkouts. Do not track this directory or anything inside it.
 ref_repos/
+
+# Generated from VERSION by scripts/build.cmd.
+scripts/version.h

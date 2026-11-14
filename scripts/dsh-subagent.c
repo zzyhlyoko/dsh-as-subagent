@@ -3,10 +3,11 @@
  * No .NET and no VC++ redistributable. Link dynamically only to libraries
  * that ship with Windows 10 or later (KERNEL32 and the Universal CRT):
  *
- *   gcc -municode -O2 -s -Wall -Wextra -static-libgcc -o dsh-subagent.exe dsh-subagent.c
+ *   scripts\build.cmd
  *
- * -static-libgcc keeps libgcc inside the exe. Do not pass -static (that
- * pulls a static copy of the CRT) and do not link vcruntime / msvcp.
+ * The build reads ../VERSION and writes version.h. -static-libgcc keeps
+ * libgcc inside the exe. Do not pass -static (that pulls a static copy of
+ * the CRT) and do not link vcruntime / msvcp.
  * stdout and stderr are UTF-8 when redirected. On a console they are
  * written with WriteConsoleW so Chinese still displays.
  */
@@ -16,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include "version.h"
 
 static HANDLE g_out;
 static HANDLE g_err;
@@ -141,6 +143,13 @@ static int streq(const wchar_t *a, const wchar_t *b) {
     return wcscmp(a, b) == 0;
 }
 
+static wchar_t *wstrdup(const wchar_t *s) {
+    size_t n = wcslen(s);
+    wchar_t *d = (wchar_t *)xmalloc((n + 1) * sizeof(wchar_t));
+    memcpy(d, s, (n + 1) * sizeof(wchar_t));
+    return d;
+}
+
 static int take_value(int argc, wchar_t **argv, int *i, wchar_t **out) {
     if (*i + 1 >= argc) return 0;
     *i += 1;
@@ -204,6 +213,36 @@ static int effort_blank(const wchar_t *s) {
     int blank = t[0] == 0 || streq(t, L"default");
     free(t);
     return blank;
+}
+
+/* provider/model or provider/model/effort. The third segment is optional and
+ * belongs only to this entry. Blank or "default" omits reasoningEffort. */
+static int parse_pool_entry(const wchar_t *s, wchar_t **prov, wchar_t **mod, wchar_t **effort) {
+    wchar_t *t = wtrim_dup(s ? s : L"");
+    wchar_t *slash1 = wcschr(t, L'/');
+    if (!slash1) { free(t); return 0; }
+    *slash1 = 0;
+    wchar_t *slash2 = wcschr(slash1 + 1, L'/');
+    if (slash2) {
+        *slash2 = 0;
+        if (wcschr(slash2 + 1, L'/')) { free(t); return 0; }
+    }
+    wchar_t *p = wtrim_dup(t);
+    wchar_t *m = wtrim_dup(slash1 + 1);
+    wchar_t *e = NULL;
+    int ok = p[0] && m[0];
+    if (ok && slash2) {
+        wchar_t *et = wtrim_dup(slash2 + 1);
+        if (!et[0] || effort_blank(et)) free(et);
+        else if (!effort_ok(et)) { free(et); ok = 0; }
+        else e = et;
+    }
+    free(t);
+    if (!ok) { free(p); free(m); free(e); return 0; }
+    *prov = p;
+    *mod = m;
+    *effort = e;
+    return 1;
 }
 
 static int file_exists(const wchar_t *path) {
@@ -284,6 +323,54 @@ static void wlist_add(WList *list, wchar_t *owned) {
         list->items = (wchar_t **)xrealloc(list->items, (size_t)list->cap * sizeof(wchar_t *));
     }
     list->items[list->n++] = owned;
+}
+
+typedef struct {
+    wchar_t *provider;
+    wchar_t *model;
+    wchar_t *effort;
+} ModelRef;
+
+typedef struct {
+    ModelRef *items;
+    int n;
+    int cap;
+} ModelList;
+
+static void model_list_free(ModelList *list) {
+    int i;
+    for (i = 0; i < list->n; i++) {
+        free(list->items[i].provider);
+        free(list->items[i].model);
+        free(list->items[i].effort);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->n = list->cap = 0;
+}
+
+static void model_list_grow(ModelList *list) {
+    if (list->n + 1 <= list->cap) return;
+    list->cap = list->cap ? list->cap * 2 : 4;
+    list->items = (ModelRef *)xrealloc(list->items, (size_t)list->cap * sizeof(ModelRef));
+}
+
+static void model_list_append(ModelList *list, wchar_t *provider, wchar_t *model, wchar_t *effort) {
+    model_list_grow(list);
+    list->items[list->n].provider = provider;
+    list->items[list->n].model = model;
+    list->items[list->n].effort = effort;
+    list->n++;
+}
+
+static void model_list_insert_first(ModelList *list, wchar_t *provider, wchar_t *model, wchar_t *effort) {
+    model_list_grow(list);
+    if (list->n > 0)
+        memmove(&list->items[1], &list->items[0], (size_t)list->n * sizeof(ModelRef));
+    list->items[0].provider = provider;
+    list->items[0].model = model;
+    list->items[0].effort = effort;
+    list->n++;
 }
 
 typedef struct {
@@ -735,12 +822,45 @@ static void print_help(void) {
         "  --cwd <dir>            working directory for the child session\n"
         "  --provider <name>      provider route (default deepseek-official)\n"
         "  --model <id>           model id (default deepseek-flash when overriding)\n"
+        "  --model-pool <p>/<m>[/<e>]  pool entry, repeatable; effort is optional per entry\n"
         "  --reasoning-effort <e> low / off / high / max; empty or default omits it\n"
         "  --patch <file>         extra --patch overlay (repeatable)\n"
         "  --retries <n>          total attempts on failure (default 1)\n"
         "  --retry-delay <sec>    delay between retries (default 2)\n"
         "  --raw                  print only the final answer\n"
+        "  --version              print the version and exit\n"
         "  --help                 show this help\n");
+}
+
+static const char POOL_ENTRY_ERR[] =
+    "dsh-subagent: model-pool entry must be provider/model or provider/model/effort "
+    "(effort is low/off/high/max; omit it for the model default).\n";
+
+static int write_model_patch(const wchar_t *path, const wchar_t *provider, const wchar_t *model, const wchar_t *effort) {
+    char *prov = wide_to_utf8(provider);
+    char *mod = wide_to_utf8(model);
+    char *eff = effort ? wide_to_utf8(effort) : NULL;
+    Buf b;
+    memset(&b, 0, sizeof b);
+    buf_str(&b, "- id: agent-default-model\n  config:\n    provider: ");
+    buf_str(&b, prov);
+    buf_str(&b, "\n    model: ");
+    buf_str(&b, mod);
+    if (eff && eff[0]) {
+        buf_str(&b, "\n    reasoningEffort: ");
+        buf_str(&b, eff);
+    }
+    buf_str(&b, "\n");
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    int ok = 0;
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD wr = 0;
+        ok = WriteFile(h, b.p, (DWORD)b.n, &wr, NULL) && wr == (DWORD)b.n;
+        CloseHandle(h);
+    }
+    buf_free(&b);
+    free(prov); free(mod); free(eff);
+    return ok;
 }
 
 static wchar_t *make_patch(const wchar_t *provider, const wchar_t *model, const wchar_t *effort) {
@@ -751,32 +871,44 @@ static wchar_t *make_patch(const wchar_t *provider, const wchar_t *model, const 
     swprintf(name, 128, L"dsh-subagent-model-%08lx%08lx.yml",
              (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount());
     wchar_t *path = join_path(temp, name);
-    char *prov = wide_to_utf8(provider);
-    char *mod = wide_to_utf8(model);
-    char *eff = effort ? wide_to_utf8(effort) : NULL;
+    if (!write_model_patch(path, provider, model, effort)) {
+        free(path);
+        return NULL;
+    }
+    return path;
+}
+
+static void buf_model_ref(Buf *b, const ModelRef *model) {
+    char *p = wide_to_utf8(model->provider);
+    char *m = wide_to_utf8(model->model);
+    buf_str(b, p);
+    buf_str(b, "/");
+    buf_str(b, m);
+    if (model->effort && model->effort[0]) {
+        char *e = wide_to_utf8(model->effort);
+        buf_str(b, "/");
+        buf_str(b, e);
+        free(e);
+    }
+    free(p);
+    free(m);
+}
+
+static void write_pool_switch(int index, int total, const ModelRef *from, const ModelRef *to, int attempts) {
     Buf b;
     memset(&b, 0, sizeof b);
-    buf_str(&b, "- id: agent-default-model\n  config:\n    provider: ");
-    buf_str(&b, prov);
-    buf_str(&b, "\n    model: ");
-    buf_str(&b, mod);
-    if (eff) {
-        buf_str(&b, "\n    reasoningEffort: ");
-        buf_str(&b, eff);
-    }
-    buf_str(&b, "\n");
-    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        free(path);
-        path = NULL;
-    } else {
-        DWORD wr = 0;
-        WriteFile(h, b.p, (DWORD)b.n, &wr, NULL);
-        CloseHandle(h);
-    }
+    char num[64];
+    sprintf(num, "dsh-subagent: model pool switch %d/%d from ", index, total);
+    buf_str(&b, num);
+    buf_model_ref(&b, from);
+    buf_str(&b, " to ");
+    buf_model_ref(&b, to);
+    sprintf(num, " after %d failed attempts.\n", attempts);
+    buf_str(&b, num);
+    buf_reserve(&b, 1);
+    b.p[b.n] = 0;
+    write_err(b.p);
     buf_free(&b);
-    free(prov); free(mod); free(eff);
-    return path;
 }
 
 int wmain(int argc, wchar_t **argv) {
@@ -790,6 +922,8 @@ int wmain(int argc, wchar_t **argv) {
     wchar_t *provider = NULL;
     wchar_t *model = NULL;
     wchar_t *effort = NULL;
+    ModelList models;
+    memset(&models, 0, sizeof models);
     WList patches;
     memset(&patches, 0, sizeof patches);
     int retries = 1;
@@ -821,6 +955,16 @@ int wmain(int argc, wchar_t **argv) {
         } else if (streq(a, L"--model")) {
             wchar_t *v = NULL;
             if (take_value(argc, argv, &i, &v)) model = v;
+        } else if (streq(a, L"--model-pool")) {
+            wchar_t *v = NULL;
+            wchar_t *p = NULL, *m = NULL, *e = NULL;
+            if (!take_value(argc, argv, &i, &v) || !parse_pool_entry(v, &p, &m, &e)) {
+                write_err(POOL_ENTRY_ERR);
+                free(task);
+                model_list_free(&models);
+                return 2;
+            }
+            model_list_append(&models, p, m, e);
         } else if (streq(a, L"--reasoning-effort")) {
             wchar_t *v = NULL;
             if (take_value(argc, argv, &i, &v)) effort = v;
@@ -835,8 +979,15 @@ int wmain(int argc, wchar_t **argv) {
             if (take_value(argc, argv, &i, &v)) parse_f64(v, &retry_delay);
         } else if (streq(a, L"--raw")) {
             raw = 1;
+        } else if (streq(a, L"--version")) {
+            write_out("dsh-subagent " DSH_SUBAGENT_VERSION "\n");
+            free(task);
+            model_list_free(&models);
+            return 0;
         } else if (streq(a, L"--help") || streq(a, L"-h")) {
             print_help();
+            free(task);
+            model_list_free(&models);
             return 0;
         } else if (a[0] == L'-' && !streq(a, L"-")) {
             char *opt = wide_to_utf8(a);
@@ -844,6 +995,8 @@ int wmain(int argc, wchar_t **argv) {
             write_err(opt);
             write_err("\n");
             free(opt);
+            free(task);
+            model_list_free(&models);
             return 2;
         } else if (!streq(a, L"-")) {
             if (!task_set) {
@@ -873,6 +1026,7 @@ int wmain(int argc, wchar_t **argv) {
     if (!task[0]) {
         write_err("dsh-subagent: empty task (use --task or pipe stdin).\n");
         free(task);
+        model_list_free(&models);
         return 2;
     }
     if (retries < 1) retries = 1;
@@ -881,6 +1035,23 @@ int wmain(int argc, wchar_t **argv) {
     if (effort && !effort_ok(effort)) {
         write_err("dsh-subagent: reasoning-effort must be low/off/high/max, or empty for the model default.\n");
         free(task);
+        model_list_free(&models);
+        return 2;
+    }
+    if (provider || model) {
+        model_list_insert_first(&models,
+            wstrdup(provider ? provider : L"deepseek-official"),
+            wstrdup(model ? model : L"deepseek-flash"),
+            effort ? wstrdup(effort) : NULL);
+    } else if (models.n == 0 && effort) {
+        model_list_insert_first(&models,
+            wstrdup(L"deepseek-official"),
+            wstrdup(L"deepseek-flash"),
+            wstrdup(effort));
+    } else if (models.n > 0 && effort) {
+        write_err("dsh-subagent: reasoning-effort applies to --provider/--model; put per-model effort in --model-pool as provider/model/effort.\n");
+        free(task);
+        model_list_free(&models);
         return 2;
     }
 
@@ -889,6 +1060,7 @@ int wmain(int argc, wchar_t **argv) {
     if (!find_install(&node, &bin)) {
         write_err("dsh-subagent: cannot locate dsh install (node.exe + @deepseek-ai/dsh/lib/bin.js).\n");
         free(task);
+        model_list_free(&models);
         return 2;
     }
     wchar_t *old_cwd = NULL;
@@ -900,6 +1072,7 @@ int wmain(int argc, wchar_t **argv) {
             write_err("\n");
             free(c);
             free(task); free(node); free(bin);
+            model_list_free(&models);
             return 2;
         }
         DWORD n = GetCurrentDirectoryW(0, NULL);
@@ -909,10 +1082,15 @@ int wmain(int argc, wchar_t **argv) {
     }
 
     wchar_t *tmp_patch = NULL;
-    if (provider || model || effort) {
-        const wchar_t *prov = provider ? provider : L"deepseek-official";
-        const wchar_t *mod = model ? model : L"deepseek-flash";
-        tmp_patch = make_patch(prov, mod, effort);
+    if (models.n > 0) {
+        tmp_patch = make_patch(models.items[0].provider, models.items[0].model, models.items[0].effort);
+        if (!tmp_patch) {
+            write_err("dsh-subagent: cannot write model patch.\n");
+            free(task); free(node); free(bin);
+            if (old_cwd) { SetCurrentDirectoryW(old_cwd); free(old_cwd); }
+            model_list_free(&models);
+            return 2;
+        }
     }
 
     WBuf cmd;
@@ -939,20 +1117,36 @@ int wmain(int argc, wchar_t **argv) {
     RunOut last;
     memset(&last, 0, sizeof last);
     last.exit_code = 1;
-    for (i = 1; i <= retries; i++) {
-        run_out_clear(&last);
-        run_once(node, cmd.p, task_utf8, &last);
-        if (last.exit_code == 0) break;
-        if (i < retries) {
-            char msg[128];
-            sprintf(msg, "dsh-subagent: attempt %d/%d failed (exit=%d), retry in %gs.\n",
-                    i, retries, last.exit_code, retry_delay);
-            write_err(msg);
-            if (retry_delay > 0) Sleep((DWORD)(retry_delay * 1000.0 + 0.5));
+    int model_count = models.n > 0 ? models.n : 1;
+    int mi;
+    int fail_code = 0;
+    for (mi = 0; mi < model_count && !fail_code; mi++) {
+        if (models.n > 0 && mi > 0) {
+            write_pool_switch(mi + 1, models.n, &models.items[mi - 1], &models.items[mi], retries);
+            if (!write_model_patch(tmp_patch, models.items[mi].provider, models.items[mi].model, models.items[mi].effort)) {
+                write_err("dsh-subagent: cannot write model patch.\n");
+                fail_code = 2;
+                break;
+            }
         }
+        for (i = 1; i <= retries; i++) {
+            run_out_clear(&last);
+            run_once(node, cmd.p, task_utf8, &last);
+            if (last.exit_code == 0) break;
+            if (i < retries) {
+                char msg[128];
+                sprintf(msg, "dsh-subagent: attempt %d/%d failed (exit=%d), retry in %gs.\n",
+                        i, retries, last.exit_code, retry_delay);
+                write_err(msg);
+                if (retry_delay > 0) Sleep((DWORD)(retry_delay * 1000.0 + 0.5));
+            }
+        }
+        if (last.exit_code == 0) break;
     }
 
-    if (raw) {
+    if (fail_code) {
+        /* A later pool entry could not be written. Keep the stderr error and skip the summary. */
+    } else if (raw) {
         if (last.answer) {
             write_out(last.answer);
             write_out("\n");
@@ -980,7 +1174,7 @@ int wmain(int argc, wchar_t **argv) {
         buf_free(&json);
     }
 
-    int code = last.exit_code;
+    int code = fail_code ? fail_code : last.exit_code;
     run_out_clear(&last);
     if (tmp_patch) {
         DeleteFileW(tmp_patch);
@@ -996,5 +1190,6 @@ int wmain(int argc, wchar_t **argv) {
     free(node);
     free(bin);
     free(patches.items);
+    model_list_free(&models);
     return code;
 }
