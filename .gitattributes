@@ -1,0 +1,17 @@
+# Store every text file with LF line endings.
+* text=auto eol=lf
+
+# Binaries: leave bytes unchanged and do not apply the LF rule above.
+*.exe  -text -diff !eol
+*.dll  -text -diff !eol
+*.pdb  -text -diff !eol
+*.png  -text -diff !eol
+*.jpg  -text -diff !eol
+*.jpeg -text -diff !eol
+*.gif  -text -diff !eol
+*.webp -text -diff !eol
+*.ico  -text -diff !eol
+*.pdf  -text -diff !eol
+*.zip  -text -diff !eol
+*.gz   -text -diff !eol
+*.7z   -text -diff !eol
