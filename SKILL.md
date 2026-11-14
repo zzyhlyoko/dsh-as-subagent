@@ -77,6 +77,24 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
     reasoningEffort: high   # 留空则整行不写，沿用模型默认等级
 ```
 
+## 执行权限
+
+dsh 有三档执行权限。调用器默认 `read-only`：子会话不能改文件。任务需要改工作区时显式升到 `workspace-write`；只有用户明确要求不受限制地执行时，才用 `danger-full-access`。
+
+```powershell
+& $run --task "只读检查这段代码"
+& $run --task "在这个仓库里修这个测试" --permission workspace-write
+& $run --task "按用户要求在本机任意路径执行" --permission danger-full-access
+```
+
+| 取值 | 效果 |
+|---|---|
+| `read-only` | 默认。只读，不能改文件 |
+| `workspace-write` | 可以改当前工作区和 dsh 允许的临时目录。超出范围的操作仍要审批，headless 没有界面应答，这类提权会被拒绝 |
+| `danger-full-access` | 不经沙箱、也不再询问，直接执行 |
+
+`readonly` 等同 `read-only`。`workspace` 等同 `workspace-write`。`full`、`full-access` 和 `danger full access` 等同 `danger-full-access`。这三档只钉在**新会话**上。`--session-id` 续接时，会话保持创建时的权限，本次参数不会改写它。stderr 有一行 `dsh-subagent: permission <preset>`。
+
 ## 4. 模型池与失败回退
 
 一个模型永远是 `provider` + `model`。思考等级不参与区分模型，只是这一项的可选附加。池里的一项用 `|` 分开字段，写成 `provider|model` 或 `provider|model|effort`。模型 id 可以包含 `/`，竖线不会去切它。例如 `[providerA|model1|high, providerA|model2, ark|volcengine/deepseek-v4.1-flash, route|model666|low]`。第三段只能是 `low` / `off` / `high` / `max`；不写、留空或写 `default` 都表示这一项不填 `reasoningEffort`。在 cmd 和 PowerShell 里整项要加引号，因为 `|` 是管道符。
@@ -107,11 +125,12 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 ## 5. 续接会话 + 变更本次模型
 
 ```powershell
-& $run --task "继续" --session-id <上次的sessionId> --model <新模型>
+& $run --task "继续" --session-id <上次的sessionId> --cwd <创建时的目录> --model <新模型>
 ```
 
 - 用第 1 次返回的 `sessionId` 续接；模型通过 `--model`（或 `--provider`/`--reasoning-effort`）在本次执行时重新读取，可临时更换。
-- 约束：未知 id 会**在运行前失败**；会拒绝 subagent/fork 会话、记录在其它 cwd 的会话、跑在 headless 不组合的 preset 下的会话，以及本进程中已有存活 Agent 占用该 id 的会话。
+- 工作目录用 `--cwd`。新会话会把这个目录记下来，子进程就在这里启动。续接时带同一个目录；省略时调用器从 `$DSH_HOME/storages/session_projcache/sessions/<id>.json` 的 `identity.cwd` 取回创建时的目录再启动，不用先 `cd` 过去。指向别的目录，或记录里的目录已经不存在，都会在启动前失败。缓存里没有这份记录时，子进程留在调用方的当前目录，目录不一致仍由 dsh 拒绝。stderr 有一行 `dsh-subagent: cwd <path>`。
+- 约束：未知 id 会**在运行前失败**；会拒绝 subagent/fork 会话、跑在 headless 不组合的 preset 下的会话，以及本进程中已有存活 Agent 占用该 id 的会话。
 
 ## 6. 目标、进展穿刺、强制终止
 
@@ -134,7 +153,8 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 |---|---|---|
 | `--task <text>` | 位置参数/stdin | 任务文本（多行用变量传） |
 | `--session-id <id>` | — | 续接已持久化会话 |
-| `--cwd <dir>` | 当前目录 | 子会话 workspace 根 |
+| `--cwd <dir>` | 当前目录；续接时用会话记下的目录 | 工作目录。新会话会记下它；续接必须指向同一目录 |
+| `--permission <preset>` | `read-only` | 新会话执行权限：`read-only` / `workspace-write` / `danger-full-access`。续接会话不改已钉上的权限 |
 | `--provider <name>` | `deepseek-official` | provider 路由 |
 | `--model <id>` | `deepseek-flash` | 模型 id。和 `--provider` 一起才能确定一个模型 |
 | `--model-pool <项>` | — | 模型池的一项，可重复。顺序即尝试顺序。字段用竖线分开，模型 id 可以含 `/`；第三段只作用于该项 |

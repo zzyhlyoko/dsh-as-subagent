@@ -733,7 +733,7 @@ static DWORD WINAPI read_stdout_thread(LPVOID param) {
     return 0;
 }
 
-static int run_once(const wchar_t *node, const wchar_t *cmd, const char *task_utf8, RunOut *out) {
+static int run_once(const wchar_t *node, const wchar_t *cmd, const char *task_utf8, const wchar_t *work_dir, RunOut *out) {
     SECURITY_ATTRIBUTES sa;
     memset(&sa, 0, sizeof sa);
     sa.nLength = sizeof sa;
@@ -775,7 +775,7 @@ static int run_once(const wchar_t *node, const wchar_t *cmd, const char *task_ut
     memset(&pi, 0, sizeof pi);
     BOOL ok = CreateProcessW(node, cmdline, NULL, NULL, TRUE,
                              CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
-                             NULL, NULL, &si.StartupInfo, &pi);
+                             NULL, work_dir, &si.StartupInfo, &pi);
     free(cmdline);
     DeleteProcThreadAttributeList(si.lpAttributeList);
     free(si.lpAttributeList);
@@ -820,7 +820,8 @@ static void print_help(void) {
         "Options:\n"
         "  --task <text>          task text (default: positional args, else stdin)\n"
         "  --session-id <id>      resume a persisted session\n"
-        "  --cwd <dir>            working directory for the child session\n"
+        "  --cwd <dir>            workspace directory (new session records it; resume must match it)\n"
+        "  --permission <preset>  read-only (default) / workspace-write / danger-full-access\n"
         "  --provider <name>      provider route (default deepseek-official)\n"
         "  --model <id>           model id (default deepseek-flash when overriding)\n"
         "  --model-pool <p>|<m>[|<e>]  pool entry, repeatable; '|' separates fields so model may contain '/'\n"
@@ -838,6 +839,50 @@ static const char POOL_ENTRY_ERR[] =
     "dsh-subagent: model-pool entry must be provider|model or provider|model|effort "
     "(effort is low/off/high/max; omit it for the model default). "
     "Use '|' between fields so a model id may contain '/'.\n";
+
+static const char PERM_ERR[] =
+    "dsh-subagent: permission must be read-only, workspace-write, or danger-full-access.\n";
+
+static int write_utf8_file(const wchar_t *path, const char *text);
+
+/* The three shipped presets. read-only and workspace-write keep approval ask,
+ * so a headless run with no answerer refuses anything wider than the sandbox.
+ * danger-full-access is the only preset that sets approval never. */
+static int permission_spec(const wchar_t *raw, const char **mode, const char **policy, const char **preset) {
+    if (streq(raw, L"read-only") || streq(raw, L"readonly")) {
+        *mode = *preset = "read-only";
+        *policy = "ask";
+        return 1;
+    }
+    if (streq(raw, L"workspace-write") || streq(raw, L"workspace")) {
+        *mode = *preset = "workspace-write";
+        *policy = "ask";
+        return 1;
+    }
+    if (streq(raw, L"danger-full-access") || streq(raw, L"full-access") || streq(raw, L"full")
+        || streq(raw, L"danger full access")) {
+        *mode = *preset = "danger-full-access";
+        *policy = "never";
+        return 1;
+    }
+    return 0;
+}
+
+static int write_permission_patch(const wchar_t *path, const char *mode, const char *policy, const char *preset) {
+    char body[384];
+    sprintf(body,
+            "- id: sandbox-policy\n"
+            "  config:\n"
+            "    mode: %s\n"
+            "- id: approval\n"
+            "  config:\n"
+            "    policy: %s\n"
+            "- id: permission\n"
+            "  config:\n"
+            "    defaultPreset: %s\n",
+            mode, policy, preset);
+    return write_utf8_file(path, body);
+}
 
 static int write_model_patch(const wchar_t *path, const wchar_t *provider, const wchar_t *model, const wchar_t *effort) {
     char *prov = wide_to_utf8(provider);
@@ -971,6 +1016,134 @@ static wchar_t *temp_yml(const wchar_t *tag) {
     swprintf(name, 160, L"dsh-subagent-%s-%08lx-%d.yml",
              tag, (unsigned long)GetCurrentProcessId(), ++seq);
     return join_path(temp, name);
+}
+
+static wchar_t *absolute_path(const wchar_t *path) {
+    DWORD n = GetFullPathNameW(path, 0, NULL, NULL);
+    if (n == 0) return NULL;
+    wchar_t *buf = (wchar_t *)xmalloc(n * sizeof(wchar_t));
+    DWORD got = GetFullPathNameW(path, n, buf, NULL);
+    if (got == 0 || got >= n) { free(buf); return NULL; }
+    size_t len = wcslen(buf);
+    while (len > 1 && (buf[len - 1] == L'\\' || buf[len - 1] == L'/')) {
+        if (len == 3 && buf[1] == L':') break;
+        buf[--len] = 0;
+    }
+    return buf;
+}
+
+static int session_id_safe(const wchar_t *id) {
+    const wchar_t *p;
+    if (!id || !id[0] || wcscmp(id, L".") == 0 || wcscmp(id, L"..") == 0) return 0;
+    for (p = id; *p; p++) {
+        if (*p < 32 || *p == L'\\' || *p == L'/' || *p == L':' || *p == L'*' || *p == L'?'
+            || *p == L'"' || *p == L'<' || *p == L'>' || *p == L'|') return 0;
+    }
+    return 1;
+}
+
+/* The identity cwd is the first "cwd" string inside the projection record,
+ * before the "rows" object. Later rows repeat the word inside tool text. */
+static char *json_string_value(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != ':') return NULL;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '"') return NULL;
+    p++;
+    Buf b;
+    memset(&b, 0, sizeof b);
+    while (*p && *p != '"') {
+        unsigned char c = (unsigned char)*p++;
+        if (c != '\\') {
+            buf_add(&b, (char *)&c, 1);
+            continue;
+        }
+        if (!*p) { buf_free(&b); return NULL; }
+        char e = *p++;
+        char out = 0;
+        if (e == '\\' || e == '"' || e == '/') out = e;
+        else if (e == 'n') out = '\n';
+        else if (e == 't') out = '\t';
+        else if (e == 'r') out = '\r';
+        else if (e == 'u') {
+            unsigned int cp = 0;
+            int k;
+            for (k = 0; k < 4; k++) {
+                char h = *p ? *p++ : 0;
+                cp <<= 4;
+                if (h >= '0' && h <= '9') cp += (unsigned)(h - '0');
+                else if (h >= 'a' && h <= 'f') cp += (unsigned)(h - 'a' + 10);
+                else if (h >= 'A' && h <= 'F') cp += (unsigned)(h - 'A' + 10);
+                else { buf_free(&b); return NULL; }
+            }
+            wchar_t w[2];
+            int wn = 1;
+            if (cp >= 0xD800 && cp <= 0xDBFF && p[0] == '\\' && p[1] == 'u') {
+                unsigned int lo = 0;
+                p += 2;
+                for (k = 0; k < 4; k++) {
+                    char h = *p ? *p++ : 0;
+                    lo <<= 4;
+                    if (h >= '0' && h <= '9') lo += (unsigned)(h - '0');
+                    else if (h >= 'a' && h <= 'f') lo += (unsigned)(h - 'a' + 10);
+                    else if (h >= 'A' && h <= 'F') lo += (unsigned)(h - 'A' + 10);
+                    else { buf_free(&b); return NULL; }
+                }
+                if (lo < 0xDC00 || lo > 0xDFFF) { buf_free(&b); return NULL; }
+                cp = 0x10000 + (((cp - 0xD800) << 10) | (lo - 0xDC00));
+            }
+            if (cp < 0x10000) w[0] = (wchar_t)cp;
+            else {
+                unsigned int u = cp - 0x10000;
+                w[0] = (wchar_t)(0xD800 + (u >> 10));
+                w[1] = (wchar_t)(0xDC00 + (u & 0x3FF));
+                wn = 2;
+            }
+            char tmp[8];
+            int n = WideCharToMultiByte(CP_UTF8, 0, w, wn, tmp, (int)sizeof tmp, NULL, NULL);
+            if (n > 0) buf_add(&b, tmp, n);
+            continue;
+        } else { buf_free(&b); return NULL; }
+        buf_add(&b, &out, 1);
+    }
+    if (*p != '"') { buf_free(&b); return NULL; }
+    buf_add(&b, "", 1);
+    b.n--;
+    return b.p;
+}
+
+static char *identity_cwd_utf8(const char *text) {
+    const char *id = strstr(text ? text : "", "\"identity\"");
+    if (!id) return NULL;
+    const char *rows = strstr(id, "\"rows\"");
+    const char *key = strstr(id, "\"cwd\"");
+    if (!key || (rows && key > rows)) return NULL;
+    return json_string_value(key + 5);
+}
+
+/* Headless adopts a session only when the process directory equals the cwd
+ * recorded at creation. That spelling lives in the projection cache. */
+static wchar_t *recorded_session_cwd(const wchar_t *session_id) {
+    if (!session_id_safe(session_id)) return NULL;
+    wchar_t *home = resolve_dsh_home();
+    wchar_t *storages = join_path(home, L"storages");
+    wchar_t *domain = join_path(storages, L"session_projcache");
+    wchar_t *dir = join_path(domain, L"sessions");
+    wchar_t *name = (wchar_t *)xmalloc((wcslen(session_id) + 6) * sizeof(wchar_t));
+    wcscpy(name, session_id);
+    wcscat(name, L".json");
+    wchar_t *path = join_path(dir, name);
+    free(home); free(storages); free(domain); free(dir); free(name);
+    char *text = read_file_utf8(path);
+    free(path);
+    if (!text) return NULL;
+    char *cwd8 = identity_cwd_utf8(text);
+    free(text);
+    if (!cwd8 || !cwd8[0]) { free(cwd8); return NULL; }
+    wchar_t *cwd = utf8_to_wide(cwd8, -1);
+    free(cwd8);
+    return cwd;
 }
 
 /* Model rows the web Models page writes. Other rows, including UI settings,
@@ -1109,6 +1282,7 @@ int wmain(int argc, wchar_t **argv) {
     double retry_delay = 2;
     int raw = 0;
     int skip_web = 0;
+    wchar_t *permission = NULL;
 
     int i;
     for (i = 1; i < argc; i++) {
@@ -1129,6 +1303,9 @@ int wmain(int argc, wchar_t **argv) {
         } else if (streq(a, L"--cwd") || streq(a, L"-c")) {
             wchar_t *v = NULL;
             if (take_value(argc, argv, &i, &v)) cwd = v;
+        } else if (streq(a, L"--permission")) {
+            wchar_t *v = NULL;
+            if (take_value(argc, argv, &i, &v)) permission = v;
         } else if (streq(a, L"--provider")) {
             wchar_t *v = NULL;
             if (take_value(argc, argv, &i, &v)) provider = v;
@@ -1213,6 +1390,15 @@ int wmain(int argc, wchar_t **argv) {
     }
     if (retries < 1) retries = 1;
     if (retry_delay < 0) retry_delay = 0;
+    const char *perm_mode = "read-only";
+    const char *perm_policy = "ask";
+    const char *perm_preset = "read-only";
+    if (permission && !permission_spec(permission, &perm_mode, &perm_policy, &perm_preset)) {
+        write_err(PERM_ERR);
+        free(task);
+        model_list_free(&models);
+        return 2;
+    }
     if (effort && effort_blank(effort)) effort = NULL;
     if (effort && !effort_ok(effort)) {
         write_err("dsh-subagent: reasoning-effort must be low/off/high/max, or empty for the model default.\n");
@@ -1245,22 +1431,74 @@ int wmain(int argc, wchar_t **argv) {
         model_list_free(&models);
         return 2;
     }
-    wchar_t *old_cwd = NULL;
+    wchar_t *recorded_full = NULL;
+    if (session) {
+        wchar_t *recorded = recorded_session_cwd(session);
+        if (recorded) {
+            recorded_full = absolute_path(recorded);
+            free(recorded);
+        }
+    }
+    wchar_t *work_dir = NULL;
     if (cwd) {
-        if (!dir_exists(cwd)) {
+        wchar_t *full = absolute_path(cwd);
+        if (!full || !dir_exists(full)) {
             write_err("dsh-subagent: cwd is not a directory: ");
             char *c = wide_to_utf8(cwd);
             write_err(c);
             write_err("\n");
             free(c);
+            free(full);
+            free(recorded_full);
             free(task); free(node); free(bin);
             model_list_free(&models);
             return 2;
         }
-        DWORD n = GetCurrentDirectoryW(0, NULL);
-        old_cwd = (wchar_t *)xmalloc(n * sizeof(wchar_t));
-        GetCurrentDirectoryW(n, old_cwd);
-        SetCurrentDirectoryW(cwd);
+        if (recorded_full && _wcsicmp(full, recorded_full) != 0) {
+            char *id = wide_to_utf8(session);
+            char *rec = wide_to_utf8(recorded_full);
+            char *got = wide_to_utf8(full);
+            write_err("dsh-subagent: session \"");
+            write_err(id);
+            write_err("\" was recorded in \"");
+            write_err(rec);
+            write_err("\", not \"");
+            write_err(got);
+            write_err("\".\n");
+            free(id); free(rec); free(got);
+            free(full);
+            free(recorded_full);
+            free(task); free(node); free(bin);
+            model_list_free(&models);
+            return 2;
+        }
+        work_dir = full;
+        free(recorded_full);
+        recorded_full = NULL;
+    } else if (recorded_full) {
+        if (!dir_exists(recorded_full)) {
+            char *id = wide_to_utf8(session);
+            char *rec = wide_to_utf8(recorded_full);
+            write_err("dsh-subagent: session \"");
+            write_err(id);
+            write_err("\" was recorded in \"");
+            write_err(rec);
+            write_err("\", which is not a directory.\n");
+            free(id); free(rec);
+            free(recorded_full);
+            free(task); free(node); free(bin);
+            model_list_free(&models);
+            return 2;
+        }
+        work_dir = recorded_full;
+        recorded_full = NULL;
+    }
+    if (work_dir) {
+        char *shown = wide_to_utf8(work_dir);
+        write_err("dsh-subagent: cwd ");
+        write_err(shown);
+        write_err("\n");
+        free(shown);
     }
 
     wchar_t *tmp_patch = NULL;
@@ -1268,8 +1506,7 @@ int wmain(int argc, wchar_t **argv) {
         tmp_patch = make_patch(models.items[0].provider, models.items[0].model, models.items[0].effort);
         if (!tmp_patch) {
             write_err("dsh-subagent: cannot write model patch.\n");
-            free(task); free(node); free(bin);
-            if (old_cwd) { SetCurrentDirectoryW(old_cwd); free(old_cwd); }
+            free(task); free(node); free(bin); free(work_dir);
             model_list_free(&models);
             return 2;
         }
@@ -1289,8 +1526,7 @@ int wmain(int argc, wchar_t **argv) {
                 free(shown);
                 free(src);
                 if (tmp_patch) { DeleteFileW(tmp_patch); free(tmp_patch); }
-                free(task); free(node); free(bin);
-                if (old_cwd) { SetCurrentDirectoryW(old_cwd); free(old_cwd); }
+                free(task); free(node); free(bin); free(work_dir);
                 model_list_free(&models);
                 return 2;
             }
@@ -1304,8 +1540,7 @@ int wmain(int argc, wchar_t **argv) {
                     free(src);
                     if (web_patch) { DeleteFileW(web_patch); free(web_patch); }
                     if (tmp_patch) { DeleteFileW(tmp_patch); free(tmp_patch); }
-                    free(task); free(node); free(bin);
-                    if (old_cwd) { SetCurrentDirectoryW(old_cwd); free(old_cwd); }
+                    free(task); free(node); free(bin); free(work_dir);
                     model_list_free(&models);
                     return 2;
                 }
@@ -1318,8 +1553,7 @@ int wmain(int argc, wchar_t **argv) {
                 if (cred_patch) { DeleteFileW(cred_patch); free(cred_patch); }
                 if (web_patch) { DeleteFileW(web_patch); free(web_patch); }
                 if (tmp_patch) { DeleteFileW(tmp_patch); free(tmp_patch); }
-                free(task); free(node); free(bin);
-                if (old_cwd) { SetCurrentDirectoryW(old_cwd); free(old_cwd); }
+                free(task); free(node); free(bin); free(work_dir);
                 model_list_free(&models);
                 return 2;
             }
@@ -1331,6 +1565,21 @@ int wmain(int argc, wchar_t **argv) {
             free(src);
         }
     }
+
+    wchar_t *perm_patch = temp_yml(L"permission");
+    if (!perm_patch || !write_permission_patch(perm_patch, perm_mode, perm_policy, perm_preset)) {
+        write_err("dsh-subagent: cannot write permission patch.\n");
+        if (perm_patch) { DeleteFileW(perm_patch); free(perm_patch); }
+        if (cred_patch) { DeleteFileW(cred_patch); free(cred_patch); }
+        if (web_patch) { DeleteFileW(web_patch); free(web_patch); }
+        if (tmp_patch) { DeleteFileW(tmp_patch); free(tmp_patch); }
+        free(task); free(node); free(bin); free(work_dir);
+        model_list_free(&models);
+        return 2;
+    }
+    write_err("dsh-subagent: permission ");
+    write_err(perm_preset);
+    write_err("\n");
 
     WBuf cmd;
     memset(&cmd, 0, sizeof cmd);
@@ -1353,6 +1602,9 @@ int wmain(int argc, wchar_t **argv) {
         wbuf_s(&cmd, L" --patch");
         wbuf_arg(&cmd, tmp_patch);
     }
+    /* Last overlay, so this flag wins over a profile or an extra --patch. */
+    wbuf_s(&cmd, L" --patch");
+    wbuf_arg(&cmd, perm_patch);
     wbuf_s(&cmd, L" --json");
     if (session) {
         wbuf_s(&cmd, L" --session-id");
@@ -1378,7 +1630,7 @@ int wmain(int argc, wchar_t **argv) {
         }
         for (i = 1; i <= retries; i++) {
             run_out_clear(&last);
-            run_once(node, cmd.p, task_utf8, &last);
+            run_once(node, cmd.p, task_utf8, work_dir, &last);
             if (last.exit_code == 0) break;
             if (i < retries) {
                 char msg[128];
@@ -1435,10 +1687,9 @@ int wmain(int argc, wchar_t **argv) {
         DeleteFileW(cred_patch);
         free(cred_patch);
     }
-    if (old_cwd) {
-        SetCurrentDirectoryW(old_cwd);
-        free(old_cwd);
-    }
+    DeleteFileW(perm_patch);
+    free(perm_patch);
+    free(work_dir);
     free(task_utf8);
     free(cmd.p);
     free(task);

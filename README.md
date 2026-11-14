@@ -56,7 +56,8 @@
 |---|---|---|
 | `--task <text>` | 位置参数，否则 stdin | 任务文本 |
 | `--session-id <id>` | — | 续接已持久化的会话 |
-| `--cwd <dir>` | 当前目录 | 子会话的工作区根 |
+| `--cwd <dir>` | 当前目录；续接时用会话记下的目录 | 工作目录。新会话会记下它；续接必须指向同一目录 |
+| `--permission <preset>` | `read-only` | 新会话的执行权限。`read-only`、`workspace-write`、`danger-full-access` |
 | `--provider <name>` | `deepseek-official` | provider 路由 |
 | `--model <id>` | `deepseek-flash` | 模型 id。和 `--provider` 一起才能确定一个模型 |
 | `--model-pool <项>` | — | 模型池的一项，可重复。字段用竖线分开，模型 id 可以含 `/` |
@@ -67,11 +68,23 @@
 | `--retry-delay <sec>` | 2 | 重试间隔 |
 | `--raw` | — | 只打印最终答案，不打印 JSON 摘要 |
 
+`--cwd` 是这次运行的工作目录，相对路径会先展开成绝对路径。新会话把它记进会话，子进程在这个目录启动；不写就用调用方的当前目录。续接时 dsh 只接受创建时记下的那个目录。调用器读取 `$DSH_HOME/storages/session_projcache/sessions/<id>.json` 里的 `identity.cwd`：没写 `--cwd` 就用这份记录启动，不用先切过去；写了就必须指向同一目录，否则在启动前失败。记录里的目录已经不存在时，同样在启动前失败。缓存里没有这份记录时，子进程留在调用方的当前目录。用上显式目录或记录目录时，stderr 有一行 `dsh-subagent: cwd <path>`。
+
 覆盖模型时，调用器会写一份临时 patch。`agent-default-model` 的 `config` 是整体替换，所以 `provider` 和 `model` 会一起写上。思考等级留空时不写 `reasoningEffort`：dsh 只在这个字段缺失时使用该模型的 adapter 默认等级。字面量 `default` 同样按不填处理，不会写成 `reasoningEffort: default`。
 
 一个模型是 `provider` + `model`。模型池的一项写成 `provider|model` 或 `provider|model|effort`，例如 `providerA|model1|high` 和 `ark|volcengine/deepseek-v4.1-flash`。竖线只分隔字段，模型 id 里的 `/` 会原样保留。在 cmd 和 PowerShell 里整项要加引号，因为 `|` 是管道符。调用器从第一项开始；某一项在 `--retries` 全部失败后才换下一项，并在 stderr 打印 `model pool switch`。池内换项要告诉用户，但这不是失败回退。整个池都失败后，才回退到 `deepseek-official`（先 `deepseek-flash`，已经试过则 `deepseek-chat`），再失败才改用外部 Agent 自己的 subagent。
 
 `dsh web` 把提供方写在 `$DSH_HOME/profiles/web/cordis.patch.yml`（`DSH_HOME` 为空时是 `%USERPROFILE%\.dsh`）。headless 自己的 profile 没有这份配置，而且默认关掉凭据存储，所以只指定模型名不够。调用器会自己找到这份文件，留下 `llm-*`、`deepseek-llm*` 和 `agent-default-model`，丢掉界面设置，并补上打开凭据存储的 patch。密钥仍在 `$DSH_HOME/.credentials.yaml`，不会被复制。没有指定模型时，沿用 Web 里保存的默认模型。显式的 `--patch`、`--provider`、`--model` 和 `--model-pool` 写在后面，覆盖这个默认值。`--no-web-profile` 跳过这一步。用上 web profile 时，stderr 有一行 `dsh-subagent: using web profile ...`。
+
+每次启动都会再写一份权限 patch，并且放在最后，盖过 profile 和额外的 `--patch`。它同时设置 `sandbox-policy.mode`、`approval.policy` 和 `permission.defaultPreset`，新会话按这个档位钉死：
+
+| 取值 | 沙箱 | 审批 | 效果 |
+|---|---|---|---|
+| `read-only` | `read-only` | `ask` | 不能改文件。这是默认值 |
+| `workspace-write` | `workspace-write` | `ask` | 可以改当前工作区和允许的临时目录。超出这个范围的操作仍要审批 |
+| `danger-full-access` | `danger-full-access` | `never` | 不经沙箱、也不再询问，直接执行 |
+
+`readonly` 等同 `read-only`。`workspace` 等同 `workspace-write`。`full`、`full-access` 和 `danger full access` 等同 `danger-full-access`。headless 没有审批界面，`ask` 在没有应答者时直接拒绝。因此工作区可写档位里，超出工作区的提权不会被自动放行。续接已有会话时，会话保持创建时钉上的权限，这次的 `--permission` 不会改写它。stderr 有一行 `dsh-subagent: permission <preset>`。
 
 ## 返回
 
@@ -90,13 +103,13 @@ dsh 自己的 stdout 是 NDJSON 事件流（`session`、`status`、`text`、`thi
 
 ## 版本
 
-当前版本是 **v1.1.0**。版本号只写在仓库根目录的 `VERSION` 里。`scripts\build.cmd` 读取它，生成 `scripts\version.h`，再编进 `dsh-subagent.exe`。
+当前版本是 **v1.2.0**。版本号只写在仓库根目录的 `VERSION` 里。`scripts\build.cmd` 读取它，生成 `scripts\version.h`，再编进 `dsh-subagent.exe`。
 
 ```bat
 scripts\dsh-subagent.exe --version
 ```
 
-输出 `dsh-subagent v1.1.0`。改版本时只改 `VERSION`，然后重新编译。
+输出 `dsh-subagent v1.2.0`。改版本时只改 `VERSION`，然后重新编译。
 
 ## 重新编译与测试
 

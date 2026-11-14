@@ -413,6 +413,7 @@ static void check_help(const Result *r) {
     require(calls(r) == 0, "launched");
     require(contains(r->out, "Usage:"), "usage");
     require(contains(r->out, "--session-id"), "session flag");
+    require(contains(r->out, "--permission"), "permission flag");
 }
 static void check_no_install(const Result *r) {
     require(r->code == 2, "exit");
@@ -479,11 +480,49 @@ static void check_all_three(const Result *r) {
     require(contains(r->log, "model: deepseek-chat"), "model");
     require(contains(r->log, "reasoningEffort: max"), "effort");
 }
+static void expect_permission(const Result *r, const char *preset, const char *policy) {
+    char frag[96];
+    sprintf(frag, "defaultPreset: %s", preset);
+    require(contains(r->log, frag), frag);
+    sprintf(frag, "mode: %s", preset);
+    require(contains(r->log, frag), frag);
+    sprintf(frag, "policy: %s", policy);
+    require(contains(r->log, frag), frag);
+    require(contains(r->log, "id: sandbox-policy"), "sandbox id");
+    require(contains(r->log, "id: approval"), "approval id");
+    require(contains(r->log, "id: permission"), "permission id");
+    sprintf(frag, "permission %s", preset);
+    require(contains(r->err, frag), "notice");
+}
 static void check_no_patch(const Result *r) {
     require(calls(r) == 1, "calls");
-    require(!contains(r->log, "agent-default-model"), "unexpected patch");
-    require(contains(r->log, "\"patches\":[]"), "empty patches");
+    require(!contains(r->log, "agent-default-model"), "unexpected model patch");
+    require(!contains(r->log, "\"patches\":[]"), "permission patch missing");
     require(!contains(r->err, "using web profile"), "no web profile");
+    expect_permission(r, "read-only", "ask");
+}
+static void check_permission_bad(const Result *r) {
+    require(r->code == 2, "exit");
+    require(calls(r) == 0, "launched");
+    require(contains(r->err, "read-only, workspace-write, or danger-full-access"), "stderr");
+}
+static void check_workspace(const Result *r) {
+    require(r->code == 0, "exit");
+    require(calls(r) == 1, "calls");
+    expect_permission(r, "workspace-write", "ask");
+}
+static void check_full(const Result *r) {
+    require(r->code == 0, "exit");
+    require(calls(r) == 1, "calls");
+    expect_permission(r, "danger-full-access", "never");
+}
+static void check_permission_last(const Result *r) {
+    const char *hello = strstr(r->log, "hello: true");
+    const char *model = strstr(r->log, "agent-default-model");
+    const char *perm = strstr(r->log, "defaultPreset: workspace-write");
+    require(hello && model && perm, "pieces");
+    require(hello < model && model < perm, "permission last");
+    expect_permission(r, "workspace-write", "ask");
 }
 static void check_web_profile(const Result *r) {
     require(r->code == 0, "exit");
@@ -651,6 +690,25 @@ static void check_session_space(const Result *r) { check_shape_base(r, "sess ion
 static void check_cwd(const Result *r) {
     char *cwd = field_string(nth_line(r->log, 0), "cwd");
     require(cwd && _stricmp(cwd, g_child_cwd_utf8) == 0, "cwd");
+    require(contains(r->err, "dsh-subagent: cwd "), "notice");
+    free(cwd);
+}
+static void check_cwd_mismatch(const Result *r) {
+    require(r->code == 2, "exit");
+    require(calls(r) == 0, "launched");
+    require(contains(r->err, "was recorded in"), "stderr");
+}
+static void check_cwd_gone(const Result *r) {
+    require(r->code == 2, "exit");
+    require(calls(r) == 0, "launched");
+    require(contains(r->err, "which is not a directory"), "stderr");
+}
+static void check_caller_cwd(const Result *r) {
+    char *cwd = field_string(nth_line(r->log, 0), "cwd");
+    require(calls(r) == 1, "calls");
+    require(cwd && strstr(cwd, "\\work") != NULL, "case work dir");
+    require(_stricmp(cwd, g_child_cwd_utf8) != 0, "not the recorded dir");
+    require(!contains(r->err, "dsh-subagent: cwd "), "no recorded cwd");
     free(cwd);
 }
 static void check_user_then_model(const Result *r) {
@@ -968,6 +1026,40 @@ int wmain(int argc, wchar_t **argv) {
     sprintf(cmd_missing, "--task t --cwd \"%s\"", miss);
     sprintf(cmd_file, "--task t --cwd \"%s\"", file);
     sprintf(cmd_cwd, "--task t --cwd \"%s\"", cwd);
+    {
+        wchar_t sessions[MAX_PATH];
+        wcscpy(sessions, g_empty_dsh);
+        wcscat(sessions, L"\\storages");
+        CreateDirectoryW(sessions, NULL);
+        wcscat(sessions, L"\\session_projcache");
+        CreateDirectoryW(sessions, NULL);
+        wcscat(sessions, L"\\sessions");
+        CreateDirectoryW(sessions, NULL);
+        char esc[MAX_PATH * 2];
+        char gone[MAX_PATH * 2];
+        int i, j = 0, k = 0;
+        for (i = 0; cwd[i] && j + 2 < (int)sizeof esc; i++) {
+            if (cwd[i] == '\\' || cwd[i] == '"') esc[j++] = '\\';
+            esc[j++] = cwd[i];
+        }
+        esc[j] = 0;
+        for (i = 0; miss[i] && k + 2 < (int)sizeof gone; i++) {
+            if (miss[i] == '\\' || miss[i] == '"') gone[k++] = '\\';
+            gone[k++] = miss[i];
+        }
+        gone[k] = 0;
+        char body[MAX_PATH * 4];
+        wchar_t rec_file[MAX_PATH], gone_file[MAX_PATH];
+        wcscpy(rec_file, sessions); wcscat(rec_file, L"\\session-recorded.json");
+        wcscpy(gone_file, sessions); wcscat(gone_file, L"\\session-gone.json");
+        sprintf(body, "{\"version\":7,\"record\":{\"identity\":{\"cwd\":\"%s\"},\"rows\":{}}}\n", esc);
+        HANDLE cf = CreateFileW(rec_file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        DWORD cwr = 0;
+        if (cf != INVALID_HANDLE_VALUE) { WriteFile(cf, body, (DWORD)strlen(body), &cwr, NULL); CloseHandle(cf); }
+        sprintf(body, "{\"version\":7,\"record\":{\"identity\":{\"cwd\":\"%s\"},\"rows\":{\"cwd\":\"later\"}}}}\n", gone);
+        cf = CreateFileW(gone_file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (cf != INVALID_HANDLE_VALUE) { WriteFile(cf, body, (DWORD)strlen(body), &cwr, NULL); CloseHandle(cf); }
+    }
     sprintf(cmd_patch, "--task t --patch \"%s\" --model deepseek-chat", user);
     sprintf(cmd_shortp, "-t t -p \"%s\"", user);
     sprintf(cmd_badpatch, "--task t --patch \"%s\"", nop);
@@ -1029,6 +1121,26 @@ int wmain(int argc, wchar_t **argv) {
     add("exe --session-id follows --json", "--task t --session-id session-abc", "", "ok", 0, 0, check_session);
     add("exe -s accepts a session id with a space", "-t t -s \"sess ion\"", "", "ok", 0, 0, check_session_space);
     add("exe --cwd becomes the child cwd", cmd_cwd, "", "ok", 0, 0, check_cwd);
+    {
+        char cmd_slash[MAX_PATH * 4];
+        char slash[MAX_PATH * 3];
+        int i;
+        for (i = 0; cwd[i] && i + 1 < (int)sizeof slash; i++) slash[i] = cwd[i] == '\\' ? '/' : cwd[i];
+        slash[i] = 0;
+        sprintf(cmd_slash, "--task t --cwd \"%s/\"", slash);
+        add("exe --cwd accepts a trailing slash and forward slashes", cmd_slash, "", "ok", 0, 0, check_cwd);
+        add("exe resume uses the recorded cwd", "--task t --session-id session-recorded", "", "ok", 0, 0, check_cwd);
+        char cmd_match[MAX_PATH * 3];
+        sprintf(cmd_match, "--task t --session-id session-recorded --cwd \"%s\"", cwd);
+        add("exe resume accepts the recorded cwd", cmd_match, "", "ok", 0, 0, check_cwd);
+        char *install = wide_to_utf8(g_install);
+        char cmd_bad[MAX_PATH * 4];
+        sprintf(cmd_bad, "--task t --session-id session-recorded --cwd \"%s\"", install);
+        add("exe resume rejects a different cwd", cmd_bad, "", "ok", 0, 0, check_cwd_mismatch);
+        free(install);
+        add("exe resume refuses a missing recorded cwd", "--task t --session-id session-gone", "", "ok", 0, 0, check_cwd_gone);
+        add("exe resume without a cache keeps the caller cwd", "--task t --session-id session-unknown", "", "ok", 0, 0, check_caller_cwd);
+    }
     add("exe -c is --cwd", cmd_cwd, "", "ok", 0, 0, NULL); /* replaced below */
     g_cases[g_case_n - 1].cmd = utf8_to_wide(""); /* placeholder overwritten next */
     /* rebuild -c command properly by replacing the last case */
@@ -1088,6 +1200,23 @@ int wmain(int argc, wchar_t **argv) {
     g_cases[g_case_n - 1].web_home = 1;
     add("exe --no-web-profile ignores a present web profile", "--task t --no-web-profile", "", "ok", 0, 0, check_no_patch);
     g_cases[g_case_n - 1].web_home = 1;
+    add("exe default permission is read-only", "--task t", "", "ok", 0, 0, check_no_patch);
+    add("exe --permission missing value stays read-only", "--task t --permission", "", "ok", 0, 0, check_no_patch);
+    add("exe --permission readonly is read-only", "--task t --permission readonly", "", "ok", 0, 0, check_no_patch);
+    add("exe --permission workspace is workspace-write", "--task t --permission workspace", "", "ok", 0, 0, check_workspace);
+    add("exe --permission workspace-write", "--task t --permission workspace-write", "", "ok", 0, 0, check_workspace);
+    add("exe --permission danger-full-access skips approval", "--task t --permission danger-full-access", "", "ok", 0, 0, check_full);
+    add("exe --permission full is danger-full-access", "--task t --permission full", "", "ok", 0, 0, check_full);
+    add("exe --permission danger full access", "--task t --permission \"danger full access\"", "", "ok", 0, 0, check_full);
+    add("exe --permission full-access", "--task t --permission full-access", "", "ok", 0, 0, check_full);
+    add("exe --permission unknown value", "--task t --permission yolo", "", "ok", 0, 1, check_permission_bad);
+    add("exe --permission empty value", "--task t --permission \"\"", "", "ok", 0, 1, check_permission_bad);
+    add("exe --permission Read-only is rejected", "--task t --permission Read-only", "", "ok", 0, 1, check_permission_bad);
+    {
+        char cmd_perm[MAX_PATH * 4];
+        sprintf(cmd_perm, "--task t --patch \"%s\" --model deepseek-chat --permission workspace-write", g_user_patch_utf8);
+        add("exe permission patch follows the model patch", cmd_perm, "", "ok", 0, 0, check_permission_last);
+    }
 
     check_imports();
     int i;
