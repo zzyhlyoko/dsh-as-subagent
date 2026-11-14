@@ -11,9 +11,10 @@
 | 路径 | 作用 |
 |---|---|
 | `SKILL.md` | 技能正文：何时委派、深度限制、模型 fallback、会话续接、失败怎么报 |
-| `scripts/dsh-subagent.exe` | 推荐调用器。直接启动 `node.exe` + `bin.js`，不经过 PowerShell |
-| `scripts/dsh-subagent.cs` | 上面这个 exe 的源码 |
-| `scripts/run-subagent.ps1` | 等价的 PowerShell 实现，参数是 `-Task` / `-Model` 风格 |
+| `scripts/dsh-subagent.exe` | 调用器。直接启动 `node.exe` + `bin.js` |
+| `scripts/dsh-subagent.c` | 调用器源码 |
+| `scripts/build.cmd` | 用 MinGW-w64 UCRT gcc 重新编译 exe |
+| `tests/run-smoke.cmd` | 编译并跑冒烟测试 |
 
 `ref_repos/` 只在本地放参考检出，已被 `.gitignore` 排除，不会进入本仓库。
 
@@ -21,7 +22,7 @@
 
 - 本机 `PATH` 上能找到 `dsh`。`dsh-subagent.exe` 会在同一目录里找 `node.exe` 和 `node_modules/@deepseek-ai/dsh/lib/bin.js`。
 - headless **不使用** GUI 里保存的凭据。API key 按「启动环境变量 → 运行目录 `.env` → `$DSH_HOME/.env`」回退。已经导出为空字符串的环境变量会挡住 `.env`。
-- `dsh-subagent.exe` 是 Windows 程序。没有 PowerShell 或不想碰执行策略时用它。`run-subagent.ps1` 需要 PowerShell；若执行策略拦截，用 `pwsh -NoProfile -ExecutionPolicy Bypass -File`。
+- `dsh-subagent.exe` 是 Windows x64 程序，面向 Windows 10 及更新版本。它只动态链接系统自带的 `KERNEL32.dll` 和 Universal CRT，不依赖 .NET，也不依赖 VC++ 运行库。
 
 ## 安装
 
@@ -29,12 +30,11 @@
 
 ```text
 .dsh\skills\dsh-as-subagent\scripts\dsh-subagent.exe
-.dsh\skills\dsh-as-subagent\scripts\run-subagent.ps1
 ```
 
 ## 调用
 
-两个调用器下面都写成 `$run`。exe 用 `--task`，ps1 用 `-Task`，其余参数一一对应。
+下面把这个 exe 写成 `$run`。
 
 ```powershell
 # 新会话，默认模型 deepseek-flash
@@ -81,16 +81,18 @@
 
 dsh 自己的 stdout 是 NDJSON 事件流（`session`、`status`、`text`、`thinking`、`tool_call`、`tool_result`、`final`）。调用器解析后只交出上面的摘要；推理和诊断留在 stderr。
 
-## 重新编译 exe
+## 重新编译与测试
 
-改了 `scripts/dsh-subagent.cs` 之后，在 `scripts` 目录执行：
+在仓库根目录执行 `tests\run-smoke.cmd`。它会调用 `scripts\build.cmd` 编译 `scripts\dsh-subagent.exe`，再用假的 `node.exe` 跑冒烟测试。
+
+编译器是 MinGW-w64 的 UCRT gcc。脚本先找 PATH 上的 `gcc.exe`，找不到就用 `C:\msys64\ucrt64\bin\gcc.exe`，并把该目录加进 PATH，否则 `cc1.exe` 找不到 MSYS2 自己的库。链接参数：
 
 ```bat
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:exe /out:dsh-subagent.exe /r:System.Web.Extensions.dll dsh-subagent.cs
+gcc -municode -O2 -s -Wall -Wextra -static-libgcc -o dsh-subagent.exe dsh-subagent.c
 ```
 
-`run-subagent.ps1` 含中文注释，保存为 **UTF-8 带 BOM**。PowerShell 5.1 在中文系统上会按 GBK 读取无 BOM 的 UTF-8，中文注释会被读坏。注释里不要写反引号。
+`-static-libgcc` 把 libgcc 收进 exe。不要加 `-static`，那会改成静态链接 CRT。成品只应导入 `KERNEL32.dll` 和 `api-ms-win-crt-*.dll`。
 
 ## 换行
 
-文本文件在仓库里统一为 LF，由 `.gitattributes` 的 `* text=auto eol=lf` 固定。本仓库本地还设置了 `core.autocrlf=false` 与 `core.eol=lf`。`*.exe` 按二进制保存，不参与换行转换。
+文本文件在仓库里统一为 LF，由 `.gitattributes` 的 `* text=auto eol=lf` 固定。本仓库本地还设置了 `core.autocrlf=false` 与 `core.eol=lf`。`*.cmd` / `*.bat` 例外，必须是 CRLF，否则 `cmd.exe` 会把括号块解析坏。`*.exe` 按二进制保存，不参与换行转换。

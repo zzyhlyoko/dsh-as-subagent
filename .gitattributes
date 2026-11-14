@@ -1,6 +1,10 @@
 # Store every text file with LF line endings.
 * text=auto eol=lf
 
+# cmd.exe parses multi-line blocks only when the file uses CRLF.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
 # Binaries: leave bytes unchanged and do not apply the LF rule above.
 *.exe  -text -diff !eol
 *.dll  -text -diff !eol

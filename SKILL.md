@@ -8,12 +8,9 @@ whenToUse: 需要委派一个自足任务给独立 dsh 进程、且希望子任�
 
 你（Codex CLI、Claude Code 等外部 Agent）默认 spawn 的 subagent 会复用你自己的前沿模型，进一步消耗有限额度。本技能让你用 `dsh --profile headless` 从命令行唤起一个**独立 dsh 进程**跑子任务，把它路由到 dsh 统一管理的任意模型上；dsh 无 GUI、不监听端口、跑完即退，天生适合被脚本/其它 agent 唤起。
 
-调用器（二选一，下文统称 `$run`）：
+调用器是 `dsh-subagent.exe`（下文称 `$run`），路径 `.dsh\skills\dsh-as-subagent\scripts\dsh-subagent.exe`。它是原生 exe，直接 spawn `node.exe + bin.js`。不需要 PowerShell，也不需要 .NET 或 VC++ 运行库；动态链接的只有 Windows 10 及更新版本自带的 `KERNEL32.dll` 和 Universal CRT。外部 Agent 当普通命令调用即可。
 
-- **`dsh-subagent.exe`（推荐）**：`.dsh\skills\dsh-as-subagent\scripts\dsh-subagent.exe`。原生 exe，直接 spawn `node.exe + bin.js`，**不需要 PowerShell**——没有执行策略、没有编码坑、没有 5.1/7 版本差异，外部 Agent 当普通命令调用即可。
-- `run-subagent.ps1`：`.dsh\skills\dsh-as-subagent\scripts\run-subagent.ps1`（PowerShell 等价实现，跨平台备选；用 `-Task` 风格参数）。
-
-两者都固定用 `--json` 抓取会话 id 与无损最终答案，返回 JSON 摘要 `{"exitCode","sessionId","answer","reason","error"}`，并以子进程退出码退出。
+它固定用 `--json` 抓取会话 id 与无损最终答案，返回 JSON 摘要 `{"exitCode","sessionId","answer","reason","error"}`，并以子进程退出码退出。
 
 ## 快速上手（三条命令）
 
@@ -113,8 +110,7 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 ## 6. 目标、进展穿刺、强制终止
 
 - **设定目标**：把目标写进任务（子进程可用 `goal` 工具自行设定并推进）。
-- **进展穿刺（首选 headless）**：后台跑 `$run` 时读它的 `--json` 事件流。事件是提交点，流式到达：
-  `session`（携带 sessionId）、`status`（`turn_start`/`step_start`/`step_end`/`turn_end`，含 `reason`）、`text`、`thinking`、`tool_call`、`tool_result`、`final`。
+- **进展穿刺（首选 headless）**：调用器自己消费 `--json` 事件流，stdout 只交回第 9 节的 JSON 摘要。运行中的诊断在 stderr（`dsh: reasoning:` 与 `dsh: <code>: <message>`）。事件本身仍是提交点：`session`（携带 sessionId）、`status`（`turn_start`/`step_start`/`step_end`/`turn_end`，含 `reason`）、`text`、`thinking`、`tool_call`、`tool_result`、`final`。
 - **进展穿刺（兜底，读历史/磁盘）**：无 headless 流或进程已退时，用本机已有的 `read-dsh-session` 技能解压会话日志
   `$env:USERPROFILE\.dsh\sessions\<工作区slug>\session-<id>\session.v4.jsonl.zstd`（7-Zip，或 `read-dsh-session\scripts\zstd-extract.mjs`）。
 - **强制终止**：终止运行它的后台作业/进程即可（job_kill / `Stop-Process`）。终止后会话日志仍在磁盘，可继续用 zstd 兜底读最后进展。
@@ -126,7 +122,7 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 
 ## 8. 调用器参数
 
-`dsh-subagent.exe` 参数（`run-subagent.ps1` 用等价的 `-Task` / `-Model` / `-Retries` 风格）：
+`dsh-subagent.exe` 参数：
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
@@ -143,8 +139,8 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 
 ## 9. 输出契约（基础）
 
-- stdout = 最终答案（默认模式）或 `--json` 的 NDJSON 事件流；stderr = 流式推理（`dsh: reasoning:`）+ 诊断（`dsh: <code>: <message>`）。
-- 退出码：0 = 完成；1 = 中止/出错/无轮次。`final.text` 是无损最终答案；`--json` 其余字符串/键上限 8 KiB。
+- 默认 stdout 是一行 JSON 摘要 `{"exitCode","sessionId","answer","reason","error"}`。`--raw` 只打印最终答案再加一个换行；没有答案时什么都不打印。stderr 仍是 dsh 的流式推理（`dsh: reasoning:`）和诊断（`dsh: <code>: <message>`）。
+- 退出码：0 = 完成；1 = 中止/出错/无轮次；参数或环境不合法时调用器自己返回 2。`answer` 来自最后一条 `final.text`，无损。dsh 的 `--json` 里其余字符串/键上限 8 KiB。
 - 凭据：headless **不用 GUI 保存的凭据**，API key 按「启动环境变量 → 运行目录 `.env` → `$DSH_HOME/.env`」回退；已导出为空的环境变量会遮蔽 `.env` 回退。
 
 ## 10. 已知限制与坑
@@ -153,5 +149,6 @@ headless 子进程**自带** `subagent` / `subagent_fork` / `workflow` / `goal` 
 - **`--patch` 的 `config` 是整体替换**：覆盖 `agent-default-model` 必须同时写 `provider` 和 `model`（见第 3 节）。
 - **子进程执行一次就退出**：不能像内置 subagent 那样持续投喂消息，只能整段 `--session-id` 续接。
 - **必须经 `dsh` 启动器运行**：绕过它会启动失败。
-- **维护脚本时**：`run-subagent.ps1` 含中文注释，必须以 UTF-8 带 BOM 保存（PowerShell 5.1 中文区域默认按 GBK 读无 BOM 的 UTF-8，会把中文注释误读成乱码破坏解析），且注释里不要出现反引号。`dsh-subagent.exe` 无此问题；改了 `dsh-subagent.cs` 后重新编译：
-  `C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:exe /out:dsh-subagent.exe /r:System.Web.Extensions.dll dsh-subagent.cs`
+- **调用器是单个原生 exe**：重定向时 stdin/stdout/stderr 按 UTF-8 读写；接到控制台时用 `WriteConsoleW`，中文可以正常显示。改了 `scripts/dsh-subagent.c` 后，在仓库根执行 `tests\run-smoke.cmd`（它会先跑 `scripts\build.cmd`）。手工编译：
+  `gcc -municode -O2 -s -Wall -Wextra -static-libgcc -o dsh-subagent.exe dsh-subagent.c`
+  不要加 `-static`，也不要链接 `vcruntime`、`msvcp` 或 MinGW 的 `libwinpthread`。成品只应导入 `KERNEL32.dll` 和 `api-ms-win-crt-*.dll`。
