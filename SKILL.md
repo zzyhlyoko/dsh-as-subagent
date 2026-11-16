@@ -160,6 +160,9 @@ dsh 有三档执行权限。调用器默认 `read-only`：子会话不能改文�
 | `--model-pool <项>` | — | 模型池的一项，可重复。顺序即尝试顺序。字段用竖线分开，模型 id 可以含 `/`；第三段只作用于该项 |
 | `--reasoning-effort <e>` | 不填 | 只作用于 `--provider`/`--model`。`low`/`off`/`high`/`max`；空或 `default` 表示沿用模型默认等级 |
 | `--patch <file>` | — | 额外 `--patch` 文件（可重复）。位于 web profile 之后，可覆盖它 |
+| `--node <exe>` | 自动识别 | `node.exe`。可以和 dsh 包不在同一目录 |
+| `--dsh-bin <file>` | 自动识别 | `@deepseek-ai/dsh/lib/bin.js` |
+| `--dsh-home <dir>` | 脚本或已有的 `DSH_HOME` | 这次运行的数据目录。PATH 上的 `dsh.cmd` 如果只是转发脚本，调用器会读出它设置的 `DSH_HOME` |
 | `--no-web-profile` | — | 不读取 `dsh web` 的 profile |
 | `--retries <n>` | 1 | 失败重试总次数（网络波动建议 5） |
 | `--retry-delay <sec>` | 2 | 重试间隔秒数 |
@@ -178,6 +181,7 @@ dsh 有三档执行权限。调用器默认 `read-only`：子会话不能改文�
 - **`--patch` 的 `config` 是整体替换**：覆盖 `agent-default-model` 必须同时写 `provider` 和 `model`（见第 3 节）。
 - **子进程执行一次就退出**：不能像内置 subagent 那样持续投喂消息，只能整段 `--session-id` 续接。
 - **必须经 `dsh` 启动器运行**：绕过它会启动失败。
+- **PATH 上的 `dsh.cmd` 可以只是转发脚本**：Node、`bin.js` 和 `DSH_HOME` 不必在同一目录。自动识别失败时用 `--node`、`--dsh-bin` 和 `--dsh-home` 分开指定；错误信息只列出试过的启动脚本路径，不打印脚本内容。
 - **调用器是单个原生 exe**：重定向时 stdin/stdout/stderr 按 UTF-8 读写；接到控制台时用 `WriteConsoleW`，中文可以正常显示。改了 `scripts/dsh-subagent.c` 后，在仓库根执行 `tests\run-smoke.cmd`（它会先跑 `scripts\build.cmd`）。手工编译：
   `gcc -municode -O2 -s -Wall -Wextra -static-libgcc -o dsh-subagent.exe dsh-subagent.c`
   不要加 `-static`，也不要链接 `vcruntime`、`msvcp` 或 MinGW 的 `libwinpthread`。成品只应导入 `KERNEL32.dll` 和 `api-ms-win-crt-*.dll`。

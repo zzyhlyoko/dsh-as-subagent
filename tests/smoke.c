@@ -25,6 +25,14 @@ static char g_child_cwd_utf8[MAX_PATH * 3];
 static char g_version_out[160];
 static wchar_t g_empty_dsh[MAX_PATH];
 static wchar_t g_web_dsh[MAX_PATH];
+static wchar_t g_portable_shim[MAX_PATH];
+static wchar_t g_portable_node[MAX_PATH];
+static wchar_t g_portable_bin[MAX_PATH];
+static wchar_t g_portable_home[MAX_PATH];
+static wchar_t g_broken_shim[MAX_PATH];
+static char g_portable_node_utf8[MAX_PATH * 3];
+static char g_portable_bin_utf8[MAX_PATH * 3];
+static char g_portable_home_utf8[MAX_PATH * 3];
 
 static void *xmalloc(size_t n) {
     void *p = malloc(n ? n : 1);
@@ -107,7 +115,7 @@ typedef struct {
     DWORD ms;
 } Result;
 
-static Result run_exe(const wchar_t *arg_cmd, const char *stdin_utf8, const char *scenario, int fails, int no_dsh, int web_home) {
+static Result run_exe(const wchar_t *arg_cmd, const char *stdin_utf8, const char *scenario, int fails, int layout, int web_home, int clear_home) {
     Result r;
     memset(&r, 0, sizeof r);
     wchar_t case_dir[MAX_PATH];
@@ -126,8 +134,14 @@ static Result run_exe(const wchar_t *arg_cmd, const char *stdin_utf8, const char
     CreateDirectoryW(work, NULL);
 
     wchar_t path_buf[32768];
-    if (no_dsh) wcscpy(path_buf, L"C:\\Windows\\System32");
-    else { wcscpy(path_buf, g_install); wcscat(path_buf, L";"); wcscat(path_buf, g_saved_path); }
+    if (layout == 1) wcscpy(path_buf, L"C:\\Windows\\System32");
+    else if (layout == 2) {
+        wcscpy(path_buf, g_portable_shim);
+        wcscat(path_buf, L";C:\\Windows\\System32");
+    } else if (layout == 3) {
+        wcscpy(path_buf, g_broken_shim);
+        wcscat(path_buf, L";C:\\Windows\\System32");
+    } else { wcscpy(path_buf, g_install); wcscat(path_buf, L";"); wcscat(path_buf, g_saved_path); }
     SetEnvironmentVariableW(L"PATH", path_buf);
     SetEnvironmentVariableW(L"DSH_FAKE_LOG", log);
     SetEnvironmentVariableW(L"DSH_FAKE_COUNTER", counter);
@@ -135,7 +149,8 @@ static Result run_exe(const wchar_t *arg_cmd, const char *stdin_utf8, const char
     wchar_t fails_w[16];
     swprintf(fails_w, 16, L"%d", fails);
     SetEnvironmentVariableW(L"DSH_FAKE_FAILS", fails_w);
-    SetEnvironmentVariableW(L"DSH_HOME", web_home ? g_web_dsh : g_empty_dsh);
+    if (clear_home) SetEnvironmentVariableW(L"DSH_HOME", NULL);
+    else SetEnvironmentVariableW(L"DSH_HOME", web_home ? g_web_dsh : g_empty_dsh);
 
     SECURITY_ATTRIBUTES sa;
     memset(&sa, 0, sizeof sa);
@@ -364,8 +379,9 @@ typedef struct {
     const char *stdin_utf8;
     const char *scenario;
     int fails;
-    int no_dsh;
+    int layout;
     int web_home;
+    int clear_home;
     void (*check)(const Result *);
 } Case;
 
@@ -383,8 +399,9 @@ static void add(const char *name, const char *cmd_utf8, const char *in, const ch
     c->stdin_utf8 = in ? in : "";
     c->scenario = scenario ? scenario : "ok";
     c->fails = fails;
-    c->no_dsh = no_dsh;
+    c->layout = no_dsh ? 1 : 0;
     c->web_home = 0;
+    c->clear_home = 0;
     c->check = check;
 }
 
@@ -414,11 +431,68 @@ static void check_help(const Result *r) {
     require(contains(r->out, "Usage:"), "usage");
     require(contains(r->out, "--session-id"), "session flag");
     require(contains(r->out, "--permission"), "permission flag");
+    require(contains(r->out, "--node"), "node flag");
+    require(contains(r->out, "--dsh-bin"), "dsh-bin flag");
+    require(contains(r->out, "--dsh-home"), "dsh-home flag");
+}
+static void check_portable(const Result *r) {
+    require(r->code == 0, "exit");
+    require(calls(r) == 1, "calls");
+    require(contains(r->log, "pkg dir"), "bin path keeps its space");
+    require(contains(r->log, "portable-route"), "profile from the forwarder home");
+    require(contains(r->err, "DSH_HOME"), "home notice");
+    require(contains(r->err, "dsh-portable"), "home path");
+    require(contains(r->err, "using web profile"), "web profile");
+    require(!contains(r->log, "super-secret-token"), "profile secret stays out of the log");
+    require(!contains(r->err, "super-secret-token"), "script secret stays off stderr");
+}
+static void check_explicit_install(const Result *r) {
+    require(r->code == 0, "exit");
+    require(calls(r) == 1, "calls");
+    require(contains(r->log, "pkg dir"), "explicit bin");
+    require(contains(r->log, "portable-route"), "explicit home profile");
+    require(contains(r->err, "DSH_HOME"), "home notice");
+    require(!contains(r->err, "super-secret-token"), "no secret");
+}
+static void check_bad_node(const Result *r) {
+    require(r->code == 2, "exit");
+    require(calls(r) == 0, "launched");
+    require(contains(r->err, "--node is not a file"), "stderr");
+    require(contains(r->err, "no-such-node.exe"), "path");
+    require(!contains(r->err, "super-secret-token"), "no secret");
+}
+static void check_bad_bin(const Result *r) {
+    require(r->code == 2, "exit");
+    require(calls(r) == 0, "launched");
+    require(contains(r->err, "--dsh-bin is not a file"), "stderr");
+    require(contains(r->err, "no-such-bin.js"), "path");
+}
+static void check_bad_home(const Result *r) {
+    require(r->code == 2, "exit");
+    require(calls(r) == 0, "launched");
+    require(contains(r->err, "--dsh-home is not a directory"), "stderr");
+}
+static void check_broken_forwarder(const Result *r) {
+    require(r->code == 2, "exit");
+    require(calls(r) == 0, "launched");
+    require(contains(r->err, "cannot locate dsh install"), "stderr");
+    require(contains(r->err, "dsh-broken-shim"), "launcher path");
+    require(contains(r->err, "--node"), "node hint");
+    require(contains(r->err, "--dsh-bin"), "bin hint");
+    require(!contains(r->err, "super-secret-token"), "secret not echoed");
+}
+static void check_node_value(const Result *r) {
+    require(r->code == 2, "exit");
+    require(calls(r) == 0, "launched");
+    require(contains(r->err, "--node requires"), "stderr");
 }
 static void check_no_install(const Result *r) {
     require(r->code == 2, "exit");
     require(calls(r) == 0, "launched");
     require(contains(r->err, "cannot locate dsh install"), "stderr");
+    require(contains(r->err, "--node"), "node hint");
+    require(contains(r->err, "--dsh-bin"), "bin hint");
+    require(contains(r->err, "--dsh-home"), "home hint");
 }
 static void check_cwd_bad(const Result *r) {
     require(r->code == 2, "exit");
@@ -988,6 +1062,131 @@ int wmain(int argc, wchar_t **argv) {
     wcscpy(bin, bin_dir); wcscat(bin, L"\\bin.js");
     wcscpy(dshcmd, g_install); wcscat(dshcmd, L"\\dsh.cmd");
     CopyFileW(argv[2], node, FALSE);
+    {
+        wchar_t base[MAX_PATH], part[MAX_PATH], node_dir[MAX_PATH];
+        HANDLE ph;
+        char *root8, *node8, body[MAX_PATH * 8];
+        const char *inner =
+            "@ECHO off\r\n"
+            "SET dp0=%~dp0\r\n"
+            "IF EXIST \"%dp0%\\node.exe\" (\r\n"
+            "  SET \"_prog=%dp0%\\node.exe\"\r\n"
+            ") ELSE (\r\n"
+            "  SET \"_prog=node\"\r\n"
+            ")\r\n"
+            "\"%_prog%\" \"%dp0%\\..\\@deepseek-ai\\dsh\\lib\\bin.js\" %*\r\n";
+        const char *profile =
+            "- id: ui-settings-general\n"
+            "  config:\n"
+            "    secretNote: super-secret-token\n"
+            "- id: llm-portable\n"
+            "  config:\n"
+            "    providers:\n"
+            "      portable-route:\n"
+            "        models:\n"
+            "          - id: portable-flash\n"
+            "- id: agent-default-model\n"
+            "  config:\n"
+            "    provider: portable-route\n"
+            "    model: portable-flash\n";
+        const char *broken =
+            "@echo off\r\n"
+            "set \"API_KEY=super-secret-token\"\r\n"
+            "rem super-secret-token\r\n"
+            "echo hello\r\n";
+        wcscpy(base, temp);
+        if (base[wcslen(base) - 1] != L'\\') wcscat(base, L"\\");
+        wcscat(base, L"dsh-portable");
+        wcscpy(g_portable_shim, base); wcscat(g_portable_shim, L"\\shim");
+        wcscpy(node_dir, base); wcscat(node_dir, L"\\node\\My Node");
+        wcscpy(g_portable_node, node_dir); wcscat(g_portable_node, L"\\node.exe");
+        wcscpy(g_portable_home, base); wcscat(g_portable_home, L"\\data");
+        wcscpy(part, base); wcscat(part, L"\\pkg dir\\app\\node_modules\\.bin");
+        wcscpy(g_portable_bin, base);
+        wcscat(g_portable_bin, L"\\pkg dir\\app\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js");
+        {
+            wchar_t dirs[8][MAX_PATH];
+            int di;
+            wcscpy(dirs[0], base);
+            wcscpy(dirs[1], g_portable_shim);
+            wcscpy(dirs[2], base); wcscat(dirs[2], L"\\node");
+            wcscpy(dirs[3], node_dir);
+            wcscpy(dirs[4], base); wcscat(dirs[4], L"\\pkg dir");
+            wcscpy(dirs[5], base); wcscat(dirs[5], L"\\pkg dir\\app");
+            wcscpy(dirs[6], base); wcscat(dirs[6], L"\\pkg dir\\app\\node_modules");
+            wcscpy(dirs[7], part);
+            for (di = 0; di < 8; di++) CreateDirectoryW(dirs[di], NULL);
+            wcscpy(part, base); wcscat(part, L"\\pkg dir\\app\\node_modules\\@deepseek-ai");
+            CreateDirectoryW(part, NULL);
+            wcscat(part, L"\\dsh");
+            CreateDirectoryW(part, NULL);
+            wcscat(part, L"\\lib");
+            CreateDirectoryW(part, NULL);
+            wcscpy(part, g_portable_home);
+            CreateDirectoryW(part, NULL);
+            wcscat(part, L"\\profiles");
+            CreateDirectoryW(part, NULL);
+            wcscat(part, L"\\web");
+            CreateDirectoryW(part, NULL);
+        }
+        CopyFileW(argv[2], g_portable_node, FALSE);
+        ph = CreateFileW(g_portable_bin, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        CloseHandle(ph);
+        wcscpy(part, g_portable_shim); wcscat(part, L"\\dsh.cmd");
+        root8 = wide_to_utf8(base);
+        node8 = wide_to_utf8(node_dir);
+        sprintf(body,
+                "@echo off\r\n"
+                "setlocal\r\n"
+                "set \"DSH_ROOT=%s\"\r\n"
+                "set \"NODE_BIN=%s\"\r\n"
+                "set \"DSH_HOME=%%DSH_ROOT%%\\data\"\r\n"
+                "set \"PATH=%%NODE_BIN%%;%%PATH%%\"\r\n"
+                "call \"%%DSH_ROOT%%\\pkg dir\\app\\node_modules\\.bin\\dsh.cmd\" %%*\r\n",
+                root8, node8);
+        ph = CreateFileW(part, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (ph != INVALID_HANDLE_VALUE) {
+            DWORD pwr = 0;
+            WriteFile(ph, body, (DWORD)strlen(body), &pwr, NULL);
+            CloseHandle(ph);
+        }
+        wcscpy(part, base); wcscat(part, L"\\pkg dir\\app\\node_modules\\.bin\\dsh.cmd");
+        ph = CreateFileW(part, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (ph != INVALID_HANDLE_VALUE) {
+            DWORD pwr = 0;
+            WriteFile(ph, inner, (DWORD)strlen(inner), &pwr, NULL);
+            CloseHandle(ph);
+        }
+        wcscpy(part, g_portable_home); wcscat(part, L"\\profiles\\web\\cordis.patch.yml");
+        ph = CreateFileW(part, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (ph != INVALID_HANDLE_VALUE) {
+            DWORD pwr = 0;
+            WriteFile(ph, profile, (DWORD)strlen(profile), &pwr, NULL);
+            CloseHandle(ph);
+        }
+        free(root8);
+        free(node8);
+        {
+            char *nu = wide_to_utf8(g_portable_node);
+            char *bu = wide_to_utf8(g_portable_bin);
+            char *hu = wide_to_utf8(g_portable_home);
+            strcpy(g_portable_node_utf8, nu);
+            strcpy(g_portable_bin_utf8, bu);
+            strcpy(g_portable_home_utf8, hu);
+            free(nu); free(bu); free(hu);
+        }
+        wcscpy(g_broken_shim, temp);
+        if (g_broken_shim[wcslen(g_broken_shim) - 1] != L'\\') wcscat(g_broken_shim, L"\\");
+        wcscat(g_broken_shim, L"dsh-broken-shim");
+        CreateDirectoryW(g_broken_shim, NULL);
+        wcscpy(part, g_broken_shim); wcscat(part, L"\\dsh.cmd");
+        ph = CreateFileW(part, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (ph != INVALID_HANDLE_VALUE) {
+            DWORD pwr = 0;
+            WriteFile(ph, broken, (DWORD)strlen(broken), &pwr, NULL);
+            CloseHandle(ph);
+        }
+    }
     HANDLE hf = CreateFileW(bin, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     CloseHandle(hf);
     hf = CreateFileW(dshcmd, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -1220,13 +1419,35 @@ int wmain(int argc, wchar_t **argv) {
         sprintf(cmd_perm, "--task t --patch \"%s\" --model deepseek-chat --permission workspace-write", g_user_patch_utf8);
         add("exe permission patch follows the model patch", cmd_perm, "", "ok", 0, 0, check_permission_last);
     }
+    add("exe portable dsh.cmd resolves split node, bin, and DSH_HOME", "--task t", "", "ok", 0, 0, check_portable);
+    g_cases[g_case_n - 1].layout = 2;
+    g_cases[g_case_n - 1].clear_home = 1;
+    {
+        char cmd_explicit[MAX_PATH * 12];
+        char cmd_home[MAX_PATH * 4];
+        sprintf(cmd_explicit, "--task t --node \"%s\" --dsh-bin \"%s\" --dsh-home \"%s\"",
+                g_portable_node_utf8, g_portable_bin_utf8, g_portable_home_utf8);
+        add("exe --node and --dsh-bin accept separate directories", cmd_explicit, "", "ok", 0, 1, check_explicit_install);
+        {
+            char *file = wide_to_utf8(g_not_dir);
+            sprintf(cmd_home, "--task t --dsh-home \"%s\"", file);
+            free(file);
+        }
+        add("exe --dsh-home rejects a file", cmd_home, "", "ok", 0, 0, check_bad_home);
+    }
+    add("exe --node rejects a missing file", "--task t --node C:\\no-such-node.exe", "", "ok", 0, 1, check_bad_node);
+    add("exe --dsh-bin rejects a missing file", "--task t --dsh-bin C:\\no-such-bin.js", "", "ok", 0, 1, check_bad_bin);
+    add("exe --node without a value is an error", "--task t --node", "", "ok", 0, 1, check_node_value);
+    add("exe a forwarding dsh.cmd that names nothing lists the script", "--task t", "", "ok", 0, 0, check_broken_forwarder);
+    g_cases[g_case_n - 1].layout = 3;
+    g_cases[g_case_n - 1].clear_home = 1;
 
     check_imports();
     int i;
     for (i = 0; i < g_case_n; i++) {
         Case *c = &g_cases[i];
         g_why = NULL;
-        Result r = run_exe(c->cmd, c->stdin_utf8, c->scenario, c->fails, c->no_dsh, c->web_home);
+        Result r = run_exe(c->cmd, c->stdin_utf8, c->scenario, c->fails, c->layout, c->web_home, c->clear_home);
         c->check(&r);
         if (g_why) {
             g_failed++;

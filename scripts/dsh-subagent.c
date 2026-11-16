@@ -266,51 +266,7 @@ static wchar_t *join_path(const wchar_t *dir, const wchar_t *rel) {
     return d;
 }
 
-static int find_install(wchar_t **node_exe, wchar_t **bin_js) {
-    DWORD need = GetEnvironmentVariableW(L"PATH", NULL, 0);
-    if (need == 0) return 0;
-    wchar_t *path = (wchar_t *)xmalloc(need * sizeof(wchar_t));
-    GetEnvironmentVariableW(L"PATH", path, need);
-    int pass;
-    for (pass = 0; pass < 2; pass++) {
-        wchar_t *scan = path;
-        while (*scan) {
-            wchar_t *semi = wcschr(scan, L';');
-            size_t len = semi ? (size_t)(semi - scan) : wcslen(scan);
-            wchar_t *dir = (wchar_t *)xmalloc((len + 1) * sizeof(wchar_t));
-            memcpy(dir, scan, len * sizeof(wchar_t));
-            dir[len] = 0;
-            wchar_t *trim = dir;
-            while (*trim == L' ' || *trim == L'\t') trim++;
-            size_t tn = wcslen(trim);
-            while (tn && (trim[tn - 1] == L' ' || trim[tn - 1] == L'\t')) trim[--tn] = 0;
-            if (*trim) {
-                wchar_t *cmd = join_path(trim, L"dsh.cmd");
-                wchar_t *ps1 = join_path(trim, L"dsh.ps1");
-                wchar_t *dexe = join_path(trim, L"dsh.exe");
-                wchar_t *node = join_path(trim, L"node.exe");
-                wchar_t *bin = join_path(trim, L"node_modules\\@deepseek-ai\\dsh\\lib\\bin.js");
-                int has_marker = file_exists(cmd) || file_exists(ps1) || file_exists(dexe);
-                int ok = file_exists(node) && file_exists(bin) && (pass == 1 || has_marker);
-                free(cmd); free(ps1); free(dexe);
-                if (ok) {
-                    *node_exe = node;
-                    *bin_js = bin;
-                    free(dir);
-                    free(path);
-                    return 1;
-                }
-                free(node);
-                free(bin);
-            }
-            free(dir);
-            if (!semi) break;
-            scan = semi + 1;
-        }
-    }
-    free(path);
-    return 0;
-}
+/* Install discovery lives further down, once path helpers and the wide buffer exist. */
 
 typedef struct {
     wchar_t **items;
@@ -827,6 +783,9 @@ static void print_help(void) {
         "  --model-pool <p>|<m>[|<e>]  pool entry, repeatable; '|' separates fields so model may contain '/'\n"
         "  --reasoning-effort <e> low / off / high / max; empty or default omits it\n"
         "  --patch <file>         extra --patch overlay (repeatable)\n"
+        "  --node <exe>           node.exe (default: discover from PATH or dsh.cmd)\n"
+        "  --dsh-bin <file>       @deepseek-ai/dsh/lib/bin.js (default: discover)\n"
+        "  --dsh-home <dir>       data directory; sets DSH_HOME for this run\n"
         "  --no-web-profile       do not load providers saved by dsh web\n"
         "  --retries <n>          total attempts on failure (default 1)\n"
         "  --retry-delay <sec>    delay between retries (default 2)\n"
@@ -1277,6 +1236,589 @@ static void write_pool_switch(int index, int total, const ModelRef *from, const 
     buf_free(&b);
 }
 
+static int ends_with_i(const wchar_t *s, const wchar_t *suf) {
+    size_t n = wcslen(s), m = wcslen(suf);
+    if (n < m) return 0;
+    return _wcsicmp(s + (n - m), suf) == 0;
+}
+
+static int word_is(const wchar_t *s, const wchar_t *word) {
+    size_t n = wcslen(word);
+    if (_wcsnicmp(s, word, n) != 0) return 0;
+    return s[n] == 0 || s[n] == L' ' || s[n] == L'\t';
+}
+
+static void write_err_w(const char *prefix, const wchar_t *path) {
+    char *u = wide_to_utf8(path ? path : L"");
+    write_err(prefix);
+    write_err(u);
+    write_err("\n");
+    free(u);
+}
+
+static int home_is_blank(void) {
+    DWORD n = GetEnvironmentVariableW(L"DSH_HOME", NULL, 0);
+    if (n <= 1) return 1;
+    wchar_t *v = (wchar_t *)xmalloc(n * sizeof(wchar_t));
+    GetEnvironmentVariableW(L"DSH_HOME", v, n);
+    wchar_t *t = wtrim_dup(v);
+    int blank = t[0] == 0;
+    free(v);
+    free(t);
+    return blank;
+}
+
+static void notice_home(const wchar_t *home) {
+    write_err_w("dsh-subagent: DSH_HOME ", home);
+}
+
+#define WALK_VARS 32
+#define WALK_SEEN 8
+
+typedef struct {
+    wchar_t *name;
+    wchar_t *value;
+} WalkVar;
+
+typedef struct {
+    WalkVar vars[WALK_VARS];
+    int nvars;
+    wchar_t *seen[WALK_SEEN];
+    int nseen;
+    wchar_t *launchers[WALK_SEEN];
+    int nlaunch;
+    wchar_t *node_bin;
+} InstallWalk;
+
+static void walk_free(InstallWalk *w) {
+    int i;
+    for (i = 0; i < w->nvars; i++) { free(w->vars[i].name); free(w->vars[i].value); }
+    for (i = 0; i < w->nseen; i++) free(w->seen[i]);
+    for (i = 0; i < w->nlaunch; i++) free(w->launchers[i]);
+    free(w->node_bin);
+    memset(w, 0, sizeof *w);
+}
+
+static wchar_t *dir_prefix(const wchar_t *file) {
+    wchar_t *full = absolute_path(file);
+    wchar_t *slash;
+    if (!full) return wstrdup(L"");
+    slash = wcsrchr(full, L'\\');
+    if (!slash) { free(full); return wstrdup(L""); }
+    slash[1] = 0;
+    return full;
+}
+
+static void var_set(InstallWalk *w, const wchar_t *name, const wchar_t *value) {
+    wchar_t *key = wstrdup(name);
+    wchar_t *p;
+    int i;
+    for (p = key; *p; p++) {
+        if (*p >= L'A' && *p <= L'Z') *p = (wchar_t)(*p - L'A' + L'a');
+    }
+    for (i = 0; i < w->nvars; i++) {
+        if (wcscmp(w->vars[i].name, key) == 0) {
+            free(w->vars[i].value);
+            w->vars[i].value = wstrdup(value);
+            free(key);
+            return;
+        }
+    }
+    if (w->nvars >= WALK_VARS) { free(key); return; }
+    w->vars[w->nvars].name = key;
+    w->vars[w->nvars].value = wstrdup(value);
+    w->nvars++;
+}
+
+static const wchar_t *var_get(InstallWalk *w, const wchar_t *name) {
+    wchar_t key[64];
+    size_t n = wcslen(name);
+    size_t i;
+    if (n >= 64) return NULL;
+    for (i = 0; i < n; i++) {
+        wchar_t c = name[i];
+        if (c >= L'A' && c <= L'Z') c = (wchar_t)(c - L'A' + L'a');
+        key[i] = c;
+    }
+    key[n] = 0;
+    for (i = 0; i < (size_t)w->nvars; i++) {
+        if (wcscmp(w->vars[i].name, key) == 0) return w->vars[i].value;
+    }
+    return NULL;
+}
+
+/* One-level expansion. %% is a literal percent. %~dp0 is this script's directory.
+ * Known assignments expand; unknown %NAME% is left in place. Values are copied
+ * raw, so a variable cannot recurse through its own replacement. */
+static wchar_t *expand_cmd(const wchar_t *s, InstallWalk *w, const wchar_t *dp0) {
+    WBuf b;
+    const wchar_t *p = s;
+    memset(&b, 0, sizeof b);
+    while (*p) {
+        if (p[0] == L'%' && p[1] == L'%') {
+            wbuf_ch(&b, L'%');
+            p += 2;
+            continue;
+        }
+        if (_wcsnicmp(p, L"%~dp0", 5) == 0) {
+            wbuf_s(&b, dp0);
+            p += 5;
+            continue;
+        }
+        if (*p == L'%') {
+            const wchar_t *end = wcschr(p + 1, L'%');
+            int ident = end && end > p + 1;
+            const wchar_t *c;
+            for (c = p + 1; ident && c < end; c++) {
+                if (!((*c >= L'A' && *c <= L'Z') || (*c >= L'a' && *c <= L'z')
+                      || (*c >= L'0' && *c <= L'9') || *c == L'_')) ident = 0;
+            }
+            if (ident) {
+                wchar_t name[64];
+                size_t n = (size_t)(end - (p + 1));
+                const wchar_t *val;
+                if (n >= 64) n = 63;
+                memcpy(name, p + 1, n * sizeof(wchar_t));
+                name[n] = 0;
+                val = var_get(w, name);
+                if (val) wbuf_s(&b, val);
+                else {
+                    wbuf_ch(&b, L'%');
+                    wbuf_s(&b, name);
+                    wbuf_ch(&b, L'%');
+                }
+                p = end + 1;
+                continue;
+            }
+        }
+        wbuf_ch(&b, *p);
+        p++;
+    }
+    if (!b.p) return wstrdup(L"");
+    return b.p;
+}
+
+static wchar_t *read_script(const wchar_t *path) {
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    char *bytes;
+    DWORD sz, got = 0;
+    int off = 0, wide = 0, utf8 = 0;
+    wchar_t *out;
+    int n;
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    sz = GetFileSize(h, NULL);
+    if (sz == INVALID_FILE_SIZE || sz > 256 * 1024) { CloseHandle(h); return NULL; }
+    bytes = (char *)xmalloc(sz + 1);
+    if (sz && !ReadFile(h, bytes, sz, &got, NULL)) { CloseHandle(h); free(bytes); return NULL; }
+    CloseHandle(h);
+    bytes[got] = 0;
+    if (got >= 2 && (unsigned char)bytes[0] == 0xFF && (unsigned char)bytes[1] == 0xFE) {
+        wide = 1;
+        off = 2;
+    } else if (got >= 3 && (unsigned char)bytes[0] == 0xEF && (unsigned char)bytes[1] == 0xBB && (unsigned char)bytes[2] == 0xBF) {
+        utf8 = 1;
+        off = 3;
+    } else if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes, (int)got, NULL, 0) > 0) {
+        utf8 = 1;
+    }
+    if (wide) {
+        n = (int)((got - (DWORD)off) / sizeof(wchar_t));
+        out = (wchar_t *)xmalloc(((size_t)n + 1) * sizeof(wchar_t));
+        memcpy(out, bytes + off, (size_t)n * sizeof(wchar_t));
+        out[n] = 0;
+        free(bytes);
+        return out;
+    }
+    n = MultiByteToWideChar(utf8 ? CP_UTF8 : CP_ACP, 0, bytes + off, (int)(got - (DWORD)off), NULL, 0);
+    out = (wchar_t *)xmalloc(((size_t)(n > 0 ? n : 0) + 1) * sizeof(wchar_t));
+    if (n > 0) MultiByteToWideChar(utf8 ? CP_UTF8 : CP_ACP, 0, bytes + off, (int)(got - (DWORD)off), out, n);
+    out[n > 0 ? n : 0] = 0;
+    free(bytes);
+    return out;
+}
+
+static int already_seen(InstallWalk *w, const wchar_t *full) {
+    int i;
+    for (i = 0; i < w->nseen; i++) if (_wcsicmp(w->seen[i], full) == 0) return 1;
+    return 0;
+}
+
+static void remember(wchar_t **slot, int *n, int cap, const wchar_t *full) {
+    if (*n >= cap) return;
+    slot[(*n)++] = wstrdup(full);
+}
+
+static wchar_t *node_from_cmd_quote(const wchar_t *path) {
+    wchar_t *text = read_script(path);
+    wchar_t *p, *hit = NULL;
+    if (!text) return NULL;
+    for (p = text; *p && !hit; ) {
+        wchar_t *q = wcschr(p, L'"');
+        wchar_t *end, *raw, *exp;
+        if (!q) break;
+        end = wcschr(q + 1, L'"');
+        if (!end) break;
+        raw = (wchar_t *)xmalloc((size_t)(end - q) * sizeof(wchar_t));
+        memcpy(raw, q + 1, (size_t)(end - (q + 1)) * sizeof(wchar_t));
+        raw[end - (q + 1)] = 0;
+        exp = wtrim_dup(raw);
+        free(raw);
+        if (ends_with_i(exp, L"node.exe") && file_exists(exp)) hit = absolute_path(exp);
+        free(exp);
+        p = end + 1;
+    }
+    free(text);
+    return hit;
+}
+
+static wchar_t *node_on_path(InstallWalk *w) {
+    DWORD need;
+    wchar_t *path, *scan;
+    if (w->node_bin && w->node_bin[0]) {
+        wchar_t *exe = join_path(w->node_bin, L"node.exe");
+        if (file_exists(exe)) {
+            wchar_t *full = absolute_path(exe);
+            if (full) { free(exe); return full; }
+            return exe;
+        }
+        free(exe);
+    }
+    need = GetEnvironmentVariableW(L"PATH", NULL, 0);
+    if (need <= 1) return NULL;
+    path = (wchar_t *)xmalloc(need * sizeof(wchar_t));
+    GetEnvironmentVariableW(L"PATH", path, need);
+    scan = path;
+    while (*scan) {
+        wchar_t *semi = wcschr(scan, L';');
+        size_t len = semi ? (size_t)(semi - scan) : wcslen(scan);
+        wchar_t *dir = (wchar_t *)xmalloc((len + 1) * sizeof(wchar_t));
+        wchar_t *trim;
+        size_t tn;
+        memcpy(dir, scan, len * sizeof(wchar_t));
+        dir[len] = 0;
+        trim = wtrim_dup(dir);
+        free(dir);
+        tn = wcslen(trim);
+        if (tn) {
+            wchar_t *exe = join_path(trim, L"node.exe");
+            wchar_t *cmd = join_path(trim, L"node.cmd");
+            if (file_exists(exe)) {
+                wchar_t *full = absolute_path(exe);
+                free(exe); free(cmd); free(trim); free(path);
+                return full;
+            }
+            if (file_exists(cmd)) {
+                wchar_t *from = node_from_cmd_quote(cmd);
+                if (from) { free(exe); free(cmd); free(trim); free(path); return from; }
+            }
+            free(exe);
+            free(cmd);
+        }
+        free(trim);
+        if (!semi) break;
+        scan = semi + 1;
+    }
+    free(path);
+    return NULL;
+}
+
+static void note_node_dir(InstallWalk *w, const wchar_t *dir) {
+    wchar_t *full;
+    wchar_t *exe;
+    if (!dir || !dir[0]) return;
+    exe = join_path(dir, L"node.exe");
+    if (!file_exists(exe)) { free(exe); return; }
+    free(exe);
+    full = absolute_path(dir);
+    free(w->node_bin);
+    w->node_bin = full ? full : wstrdup(dir);
+}
+
+static int script_resolve(const wchar_t *path, InstallWalk *w, int depth, wchar_t **node, wchar_t **bin, wchar_t **home);
+
+static void consider_quote(const wchar_t *exp, int is_call, InstallWalk *w, int depth,
+                           wchar_t **node, wchar_t **bin, wchar_t **home, int *followed) {
+    wchar_t *full;
+    if (!exp[0] || exp[0] == L':') return;
+    if (is_call && (ends_with_i(exp, L".cmd") || ends_with_i(exp, L".bat")) && file_exists(exp)) {
+        if (script_resolve(exp, w, depth + 1, node, bin, home)) *followed = 1;
+        return;
+    }
+    if (!file_exists(exp)) return;
+    full = absolute_path(exp);
+    if (!full) return;
+    if (!*node && ends_with_i(full, L"node.exe")) *node = full;
+    else if (!*bin && ends_with_i(full, L"bin.js")) *bin = full;
+    else free(full);
+}
+
+static int script_resolve(const wchar_t *path, InstallWalk *w, int depth, wchar_t **node, wchar_t **bin, wchar_t **home) {
+    wchar_t *full, *text, *dp0, *psdir, *cursor;
+    int ps1;
+    if (depth > 4) return 0;
+    full = absolute_path(path);
+    if (!full || !file_exists(full) || already_seen(w, full)) { free(full); return 0; }
+    remember(w->seen, &w->nseen, WALK_SEEN, full);
+    remember(w->launchers, &w->nlaunch, WALK_SEEN, full);
+    text = read_script(full);
+    dp0 = dir_prefix(full);
+    ps1 = ends_with_i(full, L".ps1");
+    psdir = wstrdup(dp0);
+    if (psdir[0]) {
+        size_t n = wcslen(psdir);
+        if (n && (psdir[n - 1] == L'\\' || psdir[n - 1] == L'/')) psdir[n - 1] = 0;
+    }
+    free(full);
+    if (!text) { free(dp0); free(psdir); return 0; }
+    cursor = text;
+    while (*cursor && !(*node && *bin)) {
+        wchar_t *nl = wcschr(cursor, L'\n');
+        wchar_t *line, *trim, *scan;
+        int is_call = 0;
+        if (nl) *nl = 0;
+        line = wstrdup(cursor);
+        if (nl) cursor = nl + 1;
+        else cursor += wcslen(cursor);
+        {
+            size_t n = wcslen(line);
+            if (n && line[n - 1] == L'\r') line[n - 1] = 0;
+        }
+        trim = wtrim_dup(line);
+        free(line);
+        if (trim[0] == L'@') {
+            wchar_t *rest = wtrim_dup(trim + 1);
+            free(trim);
+            trim = rest;
+        }
+        if (!trim[0] || word_is(trim, L"rem") || (trim[0] == L':' && trim[1] == L':')) {
+            free(trim);
+            continue;
+        }
+        if (ps1) {
+            WBuf b;
+            const wchar_t *s = trim;
+            memset(&b, 0, sizeof b);
+            while (*s) {
+                if (_wcsnicmp(s, L"$basedir", 8) == 0) { wbuf_s(&b, psdir); s += 8; continue; }
+                if (_wcsnicmp(s, L"$psscriptroot", 13) == 0) { wbuf_s(&b, psdir); s += 13; continue; }
+                wbuf_ch(&b, *s);
+                s++;
+            }
+            free(trim);
+            trim = b.p ? b.p : wstrdup(L"");
+        } else if (word_is(trim, L"set")) {
+            const wchar_t *rest = trim + 3;
+            wchar_t *body, *eq, *name, *val, *expanded;
+            while (*rest == L' ' || *rest == L'\t') rest++;
+            if (*rest == L'/') { free(trim); continue; }
+            if (*rest == L'"') {
+                const wchar_t *end = wcschr(rest + 1, L'"');
+                body = end ? (wchar_t *)xmalloc((size_t)(end - rest) * sizeof(wchar_t)) : wstrdup(rest + 1);
+                if (end) {
+                    memcpy(body, rest + 1, (size_t)(end - (rest + 1)) * sizeof(wchar_t));
+                    body[end - (rest + 1)] = 0;
+                }
+            } else body = wstrdup(rest);
+            eq = wcschr(body, L'=');
+            if (!eq || eq == body) { free(body); free(trim); continue; }
+            *eq = 0;
+            name = wtrim_dup(body);
+            val = wtrim_dup(eq + 1);
+            expanded = expand_cmd(val, w, dp0);
+            var_set(w, name, expanded);
+            if (_wcsicmp(name, L"node_bin") == 0) note_node_dir(w, expanded);
+            if (_wcsicmp(name, L"path") == 0 && !w->node_bin) {
+                wchar_t *semi = wcschr(expanded, L';');
+                wchar_t *first;
+                if (semi) *semi = 0;
+                first = wtrim_dup(expanded);
+                note_node_dir(w, first);
+                free(first);
+            }
+            free(expanded); free(val); free(name); free(body); free(trim);
+            continue;
+        }
+        is_call = word_is(trim, L"call");
+        scan = trim;
+        while (*scan && !(*node && *bin)) {
+            wchar_t *q = wcschr(scan, L'"');
+            wchar_t *end, *raw, *exp;
+            int followed = 0;
+            if (!q) break;
+            end = wcschr(q + 1, L'"');
+            if (!end) break;
+            raw = (wchar_t *)xmalloc((size_t)(end - q) * sizeof(wchar_t));
+            memcpy(raw, q + 1, (size_t)(end - (q + 1)) * sizeof(wchar_t));
+            raw[end - (q + 1)] = 0;
+            exp = ps1 ? wtrim_dup(raw) : expand_cmd(raw, w, dp0);
+            free(raw);
+            consider_quote(exp, is_call, w, depth, node, bin, home, &followed);
+            free(exp);
+            if (followed && *node && *bin) break;
+            scan = end + 1;
+        }
+        free(trim);
+    }
+    if (!*node) *node = node_on_path(w);
+    if (!*bin) {
+        wchar_t *rel = join_path(dp0, L"..\\@deepseek-ai\\dsh\\lib\\bin.js");
+        wchar_t *beside = join_path(dp0, L"node_modules\\@deepseek-ai\\dsh\\lib\\bin.js");
+        if (file_exists(rel)) *bin = absolute_path(rel);
+        else if (file_exists(beside)) *bin = absolute_path(beside);
+        free(rel);
+        free(beside);
+    }
+    if (!*home) {
+        const wchar_t *v = var_get(w, L"dsh_home");
+        if (v && v[0] && dir_exists(v)) {
+            wchar_t *got = absolute_path(v);
+            if (got && dir_exists(got)) *home = got;
+            else free(got);
+        }
+    }
+    free(text);
+    free(dp0);
+    free(psdir);
+    if (*node && *bin) return 1;
+    free(*node);
+    free(*bin);
+    free(*home);
+    *node = NULL;
+    *bin = NULL;
+    *home = NULL;
+    return 0;
+}
+
+typedef struct {
+    wchar_t *node;
+    wchar_t *bin;
+    int pass;
+    InstallWalk *walk;
+    wchar_t **home;
+} PathHit;
+
+static int search_one_dir(const wchar_t *dir, void *ud) {
+    PathHit *hit = (PathHit *)ud;
+    wchar_t *cmd = join_path(dir, L"dsh.cmd");
+    wchar_t *ps1 = join_path(dir, L"dsh.ps1");
+    wchar_t *dexe = join_path(dir, L"dsh.exe");
+    wchar_t *node = join_path(dir, L"node.exe");
+    wchar_t *bin = join_path(dir, L"node_modules\\@deepseek-ai\\dsh\\lib\\bin.js");
+    int has_cmd = file_exists(cmd);
+    int has_ps1 = file_exists(ps1);
+    int has_marker = has_cmd || has_ps1 || file_exists(dexe);
+    int has_both = file_exists(node) && file_exists(bin);
+    int ok = 0;
+    if (hit->pass == 0 && has_marker && has_both) {
+        hit->node = absolute_path(node);
+        hit->bin = absolute_path(bin);
+        ok = hit->node && hit->bin;
+    } else if (hit->pass == 0 && has_marker && !has_both) {
+        const wchar_t *script = has_cmd ? cmd : (has_ps1 ? ps1 : NULL);
+        if (script && script_resolve(script, hit->walk, 0, &hit->node, &hit->bin, hit->home)) ok = 1;
+    } else if (hit->pass == 1 && has_both) {
+        hit->node = absolute_path(node);
+        hit->bin = absolute_path(bin);
+        ok = hit->node && hit->bin;
+    }
+    if (!ok) {
+        free(hit->node);
+        free(hit->bin);
+        hit->node = NULL;
+        hit->bin = NULL;
+    }
+    free(cmd); free(ps1); free(dexe); free(node); free(bin);
+    return ok;
+}
+
+static int each_path_dir(int (*fn)(const wchar_t *dir, void *ud), void *ud) {
+    DWORD need = GetEnvironmentVariableW(L"PATH", NULL, 0);
+    wchar_t *path, *scan;
+    int found = 0;
+    if (need <= 1) return 0;
+    path = (wchar_t *)xmalloc(need * sizeof(wchar_t));
+    GetEnvironmentVariableW(L"PATH", path, need);
+    scan = path;
+    while (*scan && !found) {
+        wchar_t *semi = wcschr(scan, L';');
+        size_t len = semi ? (size_t)(semi - scan) : wcslen(scan);
+        wchar_t *dir = (wchar_t *)xmalloc((len + 1) * sizeof(wchar_t));
+        wchar_t *trim;
+        memcpy(dir, scan, len * sizeof(wchar_t));
+        dir[len] = 0;
+        trim = wtrim_dup(dir);
+        free(dir);
+        if (trim[0] && fn(trim, ud)) found = 1;
+        free(trim);
+        if (!semi) break;
+        scan = semi + 1;
+    }
+    free(path);
+    return found;
+}
+
+static void report_locate(InstallWalk *w, int have_node, int have_bin) {
+    int i;
+    write_err("dsh-subagent: cannot locate dsh install (node.exe + @deepseek-ai/dsh/lib/bin.js).\n");
+    write_err("dsh-subagent: looked for both files in one PATH directory, then at dsh.cmd and dsh.ps1 forwarders.\n");
+    if (w->nlaunch) {
+        write_err("dsh-subagent: checked launcher scripts:\n");
+        for (i = 0; i < w->nlaunch; i++) write_err_w("dsh-subagent:   ", w->launchers[i]);
+    }
+    if (!have_node) write_err("dsh-subagent: node.exe was not found. Pass --node <node.exe>.\n");
+    if (!have_bin) write_err("dsh-subagent: @deepseek-ai/dsh/lib/bin.js was not found. Pass --dsh-bin <bin.js>.\n");
+    write_err("dsh-subagent: pass --dsh-home <dir> when the launcher script sets DSH_HOME.\n");
+}
+
+/* node.exe and bin.js may live in different directories. A PATH dsh.cmd that
+ * only forwards to another install is read for those paths and for DSH_HOME.
+ * The script text itself is never written to the error stream. */
+static int locate_install(const wchar_t *node_arg, const wchar_t *bin_arg, wchar_t **node_exe, wchar_t **bin_js, wchar_t **home_out) {
+    InstallWalk walk;
+    PathHit hit;
+    int pass, explained = 0;
+    wchar_t *node = NULL, *bin = NULL, *home = NULL;
+    memset(&walk, 0, sizeof walk);
+    *home_out = NULL;
+    if (node_arg && !file_exists(node_arg)) {
+        write_err_w("dsh-subagent: --node is not a file: ", node_arg);
+        explained = 1;
+    }
+    if (bin_arg && !file_exists(bin_arg)) {
+        write_err_w("dsh-subagent: --dsh-bin is not a file: ", bin_arg);
+        explained = 1;
+    }
+    if (explained) return 0;
+    if (!node_arg || !bin_arg) {
+        for (pass = 0; pass < 2 && !(node && bin); pass++) {
+            memset(&hit, 0, sizeof hit);
+            hit.pass = pass;
+            hit.walk = &walk;
+            hit.home = &home;
+            if (each_path_dir(search_one_dir, &hit)) {
+                node = hit.node;
+                bin = hit.bin;
+            } else {
+                free(hit.node);
+                free(hit.bin);
+            }
+        }
+    }
+    if (node_arg) { free(node); node = absolute_path(node_arg); }
+    if (bin_arg) { free(bin); bin = absolute_path(bin_arg); }
+    if (!node || !bin) {
+        report_locate(&walk, node != NULL, bin != NULL);
+        free(node); free(bin); free(home);
+        walk_free(&walk);
+        return 0;
+    }
+    *node_exe = node;
+    *bin_js = bin;
+    *home_out = home;
+    walk_free(&walk);
+    return 1;
+}
+
 int wmain(int argc, wchar_t **argv) {
     g_out = GetStdHandle(STD_OUTPUT_HANDLE);
     g_err = GetStdHandle(STD_ERROR_HANDLE);
@@ -1297,6 +1839,9 @@ int wmain(int argc, wchar_t **argv) {
     int raw = 0;
     int skip_web = 0;
     wchar_t *permission = NULL;
+    wchar_t *node_arg = NULL;
+    wchar_t *bin_arg = NULL;
+    wchar_t *home_arg = NULL;
 
     int i;
     for (i = 1; i < argc; i++) {
@@ -1350,6 +1895,33 @@ int wmain(int argc, wchar_t **argv) {
             if (take_value(argc, argv, &i, &v)) parse_f64(v, &retry_delay);
         } else if (streq(a, L"--raw")) {
             raw = 1;
+        } else if (streq(a, L"--node")) {
+            wchar_t *v = NULL;
+            if (!take_value(argc, argv, &i, &v)) {
+                write_err("dsh-subagent: --node requires a path to node.exe.\n");
+                free(task);
+                model_list_free(&models);
+                return 2;
+            }
+            node_arg = v;
+        } else if (streq(a, L"--dsh-bin")) {
+            wchar_t *v = NULL;
+            if (!take_value(argc, argv, &i, &v)) {
+                write_err("dsh-subagent: --dsh-bin requires a path to @deepseek-ai/dsh/lib/bin.js.\n");
+                free(task);
+                model_list_free(&models);
+                return 2;
+            }
+            bin_arg = v;
+        } else if (streq(a, L"--dsh-home")) {
+            wchar_t *v = NULL;
+            if (!take_value(argc, argv, &i, &v)) {
+                write_err("dsh-subagent: --dsh-home requires a directory.\n");
+                free(task);
+                model_list_free(&models);
+                return 2;
+            }
+            home_arg = v;
         } else if (streq(a, L"--no-web-profile")) {
             skip_web = 1;
         } else if (streq(a, L"--version")) {
@@ -1439,12 +2011,32 @@ int wmain(int argc, wchar_t **argv) {
 
     wchar_t *node = NULL;
     wchar_t *bin = NULL;
-    if (!find_install(&node, &bin)) {
-        write_err("dsh-subagent: cannot locate dsh install (node.exe + @deepseek-ai/dsh/lib/bin.js).\n");
+    wchar_t *discovered_home = NULL;
+    int home_was_blank = home_is_blank();
+    if (home_arg) {
+        wchar_t *full_home = absolute_path(home_arg);
+        if (!full_home || !dir_exists(full_home)) {
+            write_err_w("dsh-subagent: --dsh-home is not a directory: ", home_arg);
+            free(full_home);
+            free(task);
+            model_list_free(&models);
+            return 2;
+        }
+        SetEnvironmentVariableW(L"DSH_HOME", full_home);
+        notice_home(full_home);
+        free(full_home);
+    }
+    if (!locate_install(node_arg, bin_arg, &node, &bin, &discovered_home)) {
+        free(discovered_home);
         free(task);
         model_list_free(&models);
         return 2;
     }
+    if (home_was_blank && !home_arg && discovered_home) {
+        SetEnvironmentVariableW(L"DSH_HOME", discovered_home);
+        notice_home(discovered_home);
+    }
+    free(discovered_home);
     wchar_t *recorded_full = NULL;
     if (session) {
         wchar_t *recorded = recorded_session_cwd(session);

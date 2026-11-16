@@ -21,7 +21,7 @@
 
 ## 前置条件
 
-- 本机 `PATH` 上能找到 `dsh`。`dsh-subagent.exe` 会在同一目录里找 `node.exe` 和 `node_modules/@deepseek-ai/dsh/lib/bin.js`。
+- 本机 `PATH` 上能找到 `dsh`。同目录里有 `node.exe` 和 `node_modules/@deepseek-ai/dsh/lib/bin.js` 时直接用。便携安装如果只在 PATH 里放转发用的 `dsh.cmd` / `dsh.ps1`，调用器会读这个脚本，分别找出 Node、`bin.js`，以及脚本里设置的 `DSH_HOME`。三者也能用 `--node`、`--dsh-bin`、`--dsh-home` 分开指定。
 - 找到 `dsh web` 的 profile 时，调用器会带上其中的模型配置，并重新打开 headless 默认关掉的凭据存储，因此 Web 里保存的提供方和密钥可以直接用。没找到时，API key 仍按「启动环境变量 → 运行目录 `.env` → `$DSH_HOME/.env`」回退。已经导出为空字符串的环境变量会挡住 `.env`。
 - `dsh-subagent.exe` 是 Windows x64 程序，面向 Windows 10 及更新版本。它只动态链接系统自带的 `KERNEL32.dll` 和 Universal CRT，不依赖 .NET，也不依赖 VC++ 运行库。
 
@@ -63,6 +63,9 @@
 | `--model-pool <项>` | — | 模型池的一项，可重复。字段用竖线分开，模型 id 可以含 `/` |
 | `--reasoning-effort <e>` | 不填 | 只作用于 `--provider`/`--model`。空或 `default` 表示不写该字段，沿用模型默认等级 |
 | `--patch <file>` | — | 额外的 `--patch` 文件，可重复。写在 web profile 之后，可以覆盖它 |
+| `--node <exe>` | 自动识别 | `node.exe`。便携安装里它可以和 dsh 包不在同一目录 |
+| `--dsh-bin <file>` | 自动识别 | `@deepseek-ai/dsh/lib/bin.js` |
+| `--dsh-home <dir>` | 脚本或环境里的 `DSH_HOME` | 这次运行使用的数据目录。转发脚本写了 `DSH_HOME` 且当前环境没设时，调用器会沿用脚本里的值 |
 | `--no-web-profile` | — | 不读取 `dsh web` 的 profile |
 | `--retries <n>` | 1 | 失败后的总尝试次数。网络抖动建议 5 |
 | `--retry-delay <sec>` | 2 | 重试间隔 |
@@ -103,13 +106,13 @@ dsh 自己的 stdout 是 NDJSON 事件流（`session`、`status`、`text`、`thi
 
 ## 版本
 
-当前版本是 **v1.2.1**。版本号只写在仓库根目录的 `VERSION` 里。`scripts\build.cmd` 读取它，生成 `scripts\version.h`，再编进 `dsh-subagent.exe`。
+当前版本是 **v1.2.2**。版本号只写在仓库根目录的 `VERSION` 里。`scripts\build.cmd` 读取它，生成 `scripts\version.h`，再编进 `dsh-subagent.exe`。
 
 ```bat
 scripts\dsh-subagent.exe --version
 ```
 
-输出 `dsh-subagent v1.2.1`。改版本时只改 `VERSION`，然后重新编译。
+输出 `dsh-subagent v1.2.2`。改版本时只改 `VERSION`，然后重新编译。
 
 ## 重新编译与测试
 
