@@ -89,11 +89,11 @@ dsh 有三档执行权限。调用器默认 `read-only`：子会话不能改文�
 
 | 取值 | 效果 |
 |---|---|
-| `read-only` | 默认。只读，不能改文件 |
+| `read-only` | 默认。只读，不能改文件。网页上的「仅可查看」就是这一档 |
 | `workspace-write` | 可以改当前工作区和 dsh 允许的临时目录。超出范围的操作仍要审批，headless 没有界面应答，这类提权会被拒绝 |
 | `danger-full-access` | 不经沙箱、也不再询问，直接执行 |
 
-`readonly` 等同 `read-only`。`workspace` 等同 `workspace-write`。`full`、`full-access` 和 `danger full access` 等同 `danger-full-access`。这三档只钉在**新会话**上。`--session-id` 续接时，会话保持创建时的权限，本次参数不会改写它。stderr 有一行 `dsh-subagent: permission <preset>`。
+`readonly` 等同 `read-only`。`workspace` 等同 `workspace-write`。`full`、`full-access` 和 `danger full access` 等同 `danger-full-access`。这三档只钉在**新会话**上。`--session-id` 续接时，会话保持创建时的权限，本次参数不会改写它。stderr 有一行 `dsh-subagent: permission <preset>`。权限 patch 会整段替换 `permission` 的 `config`，所以里面带上网页同一张三档预设表，不能只写 `defaultPreset`。
 
 ## 4. 模型池与失败回退
 

@@ -491,6 +491,9 @@ static void expect_permission(const Result *r, const char *preset, const char *p
     require(contains(r->log, "id: sandbox-policy"), "sandbox id");
     require(contains(r->log, "id: approval"), "approval id");
     require(contains(r->log, "id: permission"), "permission id");
+    require(contains(r->log, "read-only:"), "read-only preset");
+    require(contains(r->log, "workspace-write:"), "workspace-write preset");
+    require(contains(r->log, "danger-full-access:"), "full preset");
     sprintf(frag, "permission %s", preset);
     require(contains(r->err, frag), "notice");
 }

@@ -845,9 +845,12 @@ static const char PERM_ERR[] =
 
 static int write_utf8_file(const wchar_t *path, const char *text);
 
-/* The three shipped presets. read-only and workspace-write keep approval ask,
- * so a headless run with no answerer refuses anything wider than the sandbox.
- * danger-full-access is the only preset that sets approval never. */
+/* The three presets the web bundle ships. read-only is the web "仅可查看"
+ * row. read-only and workspace-write keep approval ask, so a headless run
+ * with no answerer refuses anything wider than the sandbox.
+ * danger-full-access is the only preset that sets approval never.
+ * A patch replaces an entry's config wholesale, and the permission schema
+ * default omits read-only, so the table is restated here with defaultPreset. */
 static int permission_spec(const wchar_t *raw, const char **mode, const char **policy, const char **preset) {
     if (streq(raw, L"read-only") || streq(raw, L"readonly")) {
         *mode = *preset = "read-only";
@@ -869,8 +872,8 @@ static int permission_spec(const wchar_t *raw, const char **mode, const char **p
 }
 
 static int write_permission_patch(const wchar_t *path, const char *mode, const char *policy, const char *preset) {
-    char body[384];
-    sprintf(body,
+    char body[768];
+    int n = sprintf(body,
             "- id: sandbox-policy\n"
             "  config:\n"
             "    mode: %s\n"
@@ -879,8 +882,19 @@ static int write_permission_patch(const wchar_t *path, const char *mode, const c
             "    policy: %s\n"
             "- id: permission\n"
             "  config:\n"
+            "    presets:\n"
+            "      read-only:\n"
+            "        sandbox: read-only\n"
+            "        approval: ask\n"
+            "      workspace-write:\n"
+            "        sandbox: workspace-write\n"
+            "        approval: ask\n"
+            "      danger-full-access:\n"
+            "        sandbox: danger-full-access\n"
+            "        approval: never\n"
             "    defaultPreset: %s\n",
             mode, policy, preset);
+    if (n < 0 || n >= (int)sizeof body) return 0;
     return write_utf8_file(path, body);
 }
 

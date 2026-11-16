@@ -76,7 +76,7 @@
 
 `dsh web` 把提供方写在 `$DSH_HOME/profiles/web/cordis.patch.yml`（`DSH_HOME` 为空时是 `%USERPROFILE%\.dsh`）。headless 自己的 profile 没有这份配置，而且默认关掉凭据存储，所以只指定模型名不够。调用器会自己找到这份文件，留下 `llm-*`、`deepseek-llm*` 和 `agent-default-model`，丢掉界面设置，并补上打开凭据存储的 patch。密钥仍在 `$DSH_HOME/.credentials.yaml`，不会被复制。没有指定模型时，沿用 Web 里保存的默认模型。显式的 `--patch`、`--provider`、`--model` 和 `--model-pool` 写在后面，覆盖这个默认值。`--no-web-profile` 跳过这一步。用上 web profile 时，stderr 有一行 `dsh-subagent: using web profile ...`。
 
-每次启动都会再写一份权限 patch，并且放在最后，盖过 profile 和额外的 `--patch`。它同时设置 `sandbox-policy.mode`、`approval.policy` 和 `permission.defaultPreset`，新会话按这个档位钉死：
+每次启动都会再写一份权限 patch，并且放在最后，盖过 profile 和额外的 `--patch`。它设置 `sandbox-policy.mode`、`approval.policy`，并重写 `permission` 的整份 `config`：三档预设表（`read-only`、`workspace-write`、`danger-full-access`）加上 `defaultPreset`。patch 会整段替换 `config`；只写 `defaultPreset` 会丢掉基础配置里的预设表，schema 默认又没有 `read-only`，权限插件就会启动失败。网页上的「仅可查看」就是这张表里的 `read-only`。新会话按这个档位钉死：
 
 | 取值 | 沙箱 | 审批 | 效果 |
 |---|---|---|---|
@@ -103,13 +103,13 @@ dsh 自己的 stdout 是 NDJSON 事件流（`session`、`status`、`text`、`thi
 
 ## 版本
 
-当前版本是 **v1.2.0**。版本号只写在仓库根目录的 `VERSION` 里。`scripts\build.cmd` 读取它，生成 `scripts\version.h`，再编进 `dsh-subagent.exe`。
+当前版本是 **v1.2.1**。版本号只写在仓库根目录的 `VERSION` 里。`scripts\build.cmd` 读取它，生成 `scripts\version.h`，再编进 `dsh-subagent.exe`。
 
 ```bat
 scripts\dsh-subagent.exe --version
 ```
 
-输出 `dsh-subagent v1.2.0`。改版本时只改 `VERSION`，然后重新编译。
+输出 `dsh-subagent v1.2.1`。改版本时只改 `VERSION`，然后重新编译。
 
 ## 重新编译与测试
 
